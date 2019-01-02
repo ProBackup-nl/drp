@@ -1,0 +1,213 @@
+#!/usr/bin/ash
+
+# Arch linux mkinitcpio busybox ash 
+    # [, ash, awk, basename, blkdiscard, cat, chgrp, chmod, chown, chroot, clear, cp, cttyhack, cut, dd, df, dirname, dmesg, du, echo, env,
+    # expr, fallocate, false, fatattr, free, fsfreeze, fstrim, getopt, grep, halt, head, hexdump, ifconfig, init, install, ip, ipaddr,
+    # iplink, ipneigh, iproute, iprule, iptunnel, kbd_mode, kill, killall, less, link, ln, loadfont, loadkmap, losetup, ls, lsscsi, md5sum,
+    # mkdir, mkfifo, mknod, mkpasswd, mktemp, mountpoint, mv, nc, netstat, nproc, nsenter, nslookup, openvt, partprobe, paste, pgrep,
+    # pidof, ping, ping6, poweroff, printf, ps, pwd, readlink, reboot, rm, rmdir, route, sed, seq, setfont, sh, sha1sum, sha256sum,
+    # sha512sum, shuf, sleep, sort, stat, strings, sync, tac, tail, telnet, test, tftp, touch, true, truncate, umount, uname, uniq, unlink,
+    # unshare, uptime, vi, wc, wget, xxd, yes
+# -> this introduces [^...] as synonym for [!...]
+# ASH compile time options: 
+# <https://git.archlinux.org/svntogit/packages.git/tree/trunk/config?h=packages/mkinitcpio-busybox>
+# 1.27.2 - CONFIG_ASH_BASH_COMPAT=y
+#          -> pipefail,
+#          -> substring and replacement parameter expansion ${x:y:z} and ${x/y/z},
+#          -> [[, 
+#          -> source, 
+#          -> $'...',
+#          -> &>
+readonly MKDIR=/usr/bin/mkdir
+readonly MOUNT=/usr/bin/mount
+readonly UMOUNT=/usr/bin/umount
+readonly BASENAME=/usr/bin/basename
+readonly READLINK=/usr/bin/readlink
+
+source recover-config
+
+echo 'Recovery started'
+echo
+# housekeeping
+# for nicer columnar layout, set ROWS/COLUMNS when not set
+if [ -z $COLUMNS ]; then
+  read ROWS COLUMNS <<EOF
+`stty size`
+EOF
+fi
+
+# running from tmpfs?
+#[ -f /etc/motd ] && rm /etc/motd  # don't output (incorrect) help message when dropped to shell
+
+#====================
+#
+#   WHAT / WHEN
+#
+#====================
+
+$MKDIR /tmp/snaps 2>/dev/null
+$MOUNT -o ro LABEL="$DESTINATION_DEVICE_FILESYSTEM_LABEL" /tmp/snaps 2>/dev/null
+                      # 32 = already mounted
+if [ $? -ne 0 -a $? -ne 32 ]; then
+  echo "Error [1]: mounting '$DATA_PART' fails with error $?."
+  exit 1
+fi
+if [ ! -d /tmp/snaps/Backups.backupdb/$HOST_LOCAL/ ]; then
+  echo "Error [2]: Folder containing backup(s) for '$HOST_LOCAL' not found."
+  $UMOUNT /tmp/snaps
+  exit 2
+fi
+
+# count backup snapshots
+m=0 # max. bacup versions count
+for backup_name in /tmp/snaps/Backups.backupdb/$HOST_LOCAL/2[0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9] ; do
+  if [ -e "$backup_name" -a -d "$backup_name" -a -r "$backup_name" ]; then
+    m=$(($m + 1)) # match
+  else
+    # no-match
+    echo 'Error [3]: Backup folder contains unexpected files.'
+    $UMOUNT /tmp/snaps
+    exit 3
+  fi
+done
+
+# check result
+if [ $m -eq 0 ]; then
+  # error
+  echo 'Error [4]: No backups found'
+  $UMOUNT /tmp/snaps
+  exit 4
+fi
+
+# FIXME [ $m -eq 1 ]; then
+# selection not needed, only 1 backup found
+
+
+
+# >1 backup found = select backup to restore
+# min.col.width = 5+16+1=22
+col_no=$(($COLUMNS/22))
+remainder=$(($COLUMNS-22*$col_no))
+col_width=$(($remainder/($col_no+1)+22))
+str_width=$(($col_width-5))
+remainder=$(($COLUMNS-$col_width*$col_no+1))
+remainder=$(($remainder/2))
+row_no=$((($m+$col_no-1)/$col_no))
+if [ $COLUMNS -lt 44 ]; then
+  echo 'Error [6]: Minimum 44 characters screen width required.'
+  exit 6
+fi
+#echo "COLUMNS=$COLUMNS count=$m col_no=$col_no col_width=$col_width remainder=$remainder row_no=$row_no" #debug
+set -- /tmp/snaps/Backups.backupdb/$HOST_LOCAL/2[0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]
+# $# number of positional paramaters
+# $* positional parameters expanded
+
+# `select` command is not available in busybox ash, mimic its output
+i_file=1
+i_col=1
+while true; do
+  eval backup_name\=\$$i_file # get file name from n-th (nth) positional parameter (poor man's array)
+  if [ -e "${backup_name}" -a -d "${backup_name}" -a -r "${backup_name}" ]; then 
+    if [ $remainder -le 2 -a $i_col -eq $col_no ]; then
+      printf "%3d) %-17s" $i_file ${backup_name##*/} # last column, print shortest to prevent line breakings on window resize as long as possible
+    else
+      printf "%3d) %-${str_width}s" $i_file ${backup_name##*/}
+    fi
+  else
+    echo 'Error [3]: Backup folder contains unexpected files.'
+    $UMOUNT /tmp/snaps
+    exit 3
+  fi
+
+  if [ $i_col -eq $col_no ]; then
+    i_col=1 # jump to 1st column
+    i_file=$(($i_file-$col_no*$row_no+$row_no+1))
+    echo # new line
+  else
+    i_col=$(($i_col+1)) # jump to next column
+    i_file=$(($i_file+$row_no))
+  fi
+  if [ $i_file -gt $m ]; then
+    echo
+    echo
+    break
+  fi
+done
+
+# Get file selection (number) input from user
+while read -p 'Select backup # to restore: ' p; do
+  case $p in
+      (*[^0-9]*) echo "You didn't enter a number. Try again."; unset p ;;
+      (*) [ 0 -lt "$p" -a "$p" -le "$m" ] && break || echo "Value is not in range (1-$m). Try again." ;;
+  esac
+done
+
+#eval backup_name\=\$$p
+eval 'backup_name=$'"{$p}"
+# TODO: which eval is better?
+set -- # unset positional parameters
+#v='-v'
+[ $v='-v' ] && echo "Version to restore: '${backup_name}'"
+
+# TODO: check layout file existence in this version (without, manual partitioning/formatting)
+
+#====================
+#
+#   WHERE
+#
+#====================
+
+# determine self for later exclusion
+backupdev=$($READLINK -f "$DATA_PART") # /dev/sdb2
+backupdev=${backupdev#/dev/} # sdb2
+backupdev=$($READLINK -f "/sys/class/block/${backupdev}/..") # /sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host0/target0:0:0/0:0:0:0/block/sdb
+backupdev=$($BASENAME "${backupdev}") # sdb <- https://unix.stackexchange.com/questions/308722/how-to-get-block-device-name-from-partition-device-name#308724
+
+# retrieve block devices excluding self
+set -- $(lsblk -dno NAME | grep -v ^${backupdev})
+if [ $# -eq 0 ]; then
+  echo 'Error [7]: No block devices available as destination.'
+  exit 7
+elif [ $# -eq 1 ]; then
+  restore_dev=$1
+elif [ $# -gt 1 ]; then
+  echo
+  echo
+  i=1
+  lsblk -dno NAME,SIZE,VENDOR,MODEL,SERIAL | grep -v '^${backupdev}\|  2M \|  4M ' | while IFS= read -r line; do printf '%3d) %s\n' "$i" "$line";i=$(($i+1)); done
+  #  1) sda           29.9G Samsung  Flash Drive FIT  036..........607
+  #  2) sdc          117.4G ATA      SanDisk SDSSDP12 151......808
+  #  3) mmcblk0        3.7G                           0x0097d5a9
+  #  4) mmcblk0boot0     2M
+  #  5) mmcblk0boot1     2M
+  #  6) mmcblk0rpmb      2M
+  echo
+  # Get block device (number) input from user
+  while read -p 'Select destination device #: ' p; do
+    case $p in
+        (*[^0-9]*) echo "You didn't enter a number. Try again."; unset p ;;
+        (*) [ 0 -lt "$p" -a "$p" -le "$#" ] && break || echo "Value is not in range (1-$#). Try again." ;;
+    esac
+  done
+  eval restore_dev\=\$$p
+fi
+set -- # unset positional parameters
+echo "Restore to device: '${restore_dev}'" # sdc
+
+# TODO: if is target source? yes) ask for data only restore no) layout + data restore
+
+# TODO: elseif target large enough to hold the restore
+# TODO: yes/no  erase drive?
+# TODO: recreate: partition gpt
+# TODO: recreate: partition partitions
+# TODO: recreate: format
+# TODO: recreate: swap
+# TODO: restore
+# TODO: finalize ???
+# TODO: wrapup ???
+
+# - size (in blocks) in /sys/block/sdX/size
+# - block size in -r /sys/block/sdX/queue/logical_block_size else 512
+# - original_system_used_disk_sizes in LAYOUT_FILE=.../layout/disklayout.conf, section (disk /dev/*), size in bytes
+#
+
