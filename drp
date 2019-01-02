@@ -1,0 +1,3462 @@
+#!/bin/bash
+
+#   Copyright © 2017-2019, Ceriel Jacobs <http://probackup.nl>
+
+# Licence: GPL v3
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Motivation:
+# This project started for several reasons: ReaR is too immature for Arch Linux+UEFI, 
+# couldn't find another disaster recovery solution for Linux, to be low on dependencies, 
+# to mimic Time Machine, to optimise for SSD/nvme/flash storage, to be low on (destination) 
+# disk space (hope that a btrfs snapshot without changes consumes less disk space then
+# re-creating all directories and hard-links for files.
+
+#TODO: thin weekly snapshots when low on disk space
+#TODO: verify rescue medium configs file integrity before usage (as well as the MD5sum file itself)
+#TODO: store textual configs multiple times in different compressed formats to prevent smart controllers from de-duplicating the bit-stream (and have backup copies in place)
+#TODO: at config file or integrity errors auto fall back to alternative (compressed) copies
+#TODO: cleanup logging / use journald logging
+#TODO
+#backup:snapshot source
+#backup:search subvolumes on source and snapshot these too
+#recover:ssd detected, ask for secure erase?
+#recover:no erase && partitions available -> rsync restore instead of copy
+
+# ------------- the help page ------------------------------------------
+if [ "$1" == '-h' ] || [ "$1" == '--help' ]
+then
+  cat << 'EOF'
+Version 0.01 2019-01-02
+
+USAGE: drp [--prepare /dev/<UNMOUNTED_DESTINATION_DEVICE>]
+
+PURPOSE: create a bare metal disaster backup and recovery plan. 
+
+DRP keeps 
+* hourly backups for the past 24 hours,
+* daily backups for the past month,
+* weekly backups for all previous months. 
+The oldest backups are deleted when your disk becomes full.
+
+REQUIREMENTS: 2nd block device (f.e. USB drive), UEFI, Arch Linux, systemd-boot, btrfs, dhcpcd, mkinitcpio-nfs-utils, <...more see source code...>
+
+FILES:
+- /usr/sbin/drp     									(chmod 700)   this executable
+- /usr/sbin/recover                   (chmod 700)   /usr/bin/ash script to restore system/files
+- /usr/share/drp-rsync.conf   				(chmod 600)   filter rules
+- /var/lib/drp/*								                    source system layout
+- /etc/systemd/system/drp.(service|timer)           makes hourly backups via systemd
+
+BACKUP STATUS:
+$ systemctl status drp.timer
+
+WARNING: never defragment the backup drive (btrfs defrag -> disk space bloat)
+SUPPORTED: USB, SATA, MMC, NVMe, SSH server in recovery environment (same DHCP/static IPv4)
+UNSUPPORTED: SELinux, LVM, software-RAID, hpraid, SAN (multipath), LUKS, dm-crypt, grub, consolefont, etc.
+PLANNED: swap, snapshot source btrfs, EFI boot stub, ZFS, DRDB, coreboot, Non-Extensible Reduced Firmware (NERF), ... 
+
+IMPORTANT: This is free software. There is NO warranty; not even for 
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+EOF
+  exit 1
+fi
+
+# ------------- file locations ---------------------------------------------
+readonly SOURCE='/' #source folder to backup
+
+# Bootable Linux rescue system
+#                                                   virtio = IO virtualization in KVM = Intel VT or AMD-V Kernel Virtual Machine
+#                                        sd_mod uas = USB storage
+#                                   ahci = SATA
+#                              nvme = NVM Express (NVMe) = PCIe attached SSD's
+readonly -a INCLUDE_MODULES='( nvme ahci sd_mod uas )' # Hardware migration tatget -- kernel modules to include in the rescue/recovery system
+# Already included:            usbhid, USB1|2|3 host controllers
+# Autodetection:               networking, usb keyboards, file systems
+#TODO: readonly -a MODULES_LOAD=() # Force to load these modules in the given order in the rescue/recovery system (1) udev (2) systemd (3) initrd
+readonly -a EXCLUDE_MODULES='( fjes scsi_debug )' # Kernel modules to exclude from the rescue/recovery system.
+                             # fjes = https://bugzilla.kernel.org/show_bug.cgi?id=193851
+readonly -a PROGS=(
+flashbench
+nano
+) # will be copied into recovery medium
+#TODO: readonly -a DESTINATION_FILES=(  ) # Resulting files that should be copied onto the target device
+
+
+# ------------- don't change vars below (unless you know what you are doing)
+# required for recovery
+# FIXME: make all INCLUDE_PROGS also REQUIRED_PROGS (no duplicate defination below)
+readonly -a INCLUDE_PROGS=(
+chattr
+lsattr
+lsblk
+parted
+rsync
+) 
+readonly CP='/usr/bin/cp'
+readonly DD='/usr/bin/dd'
+readonly DF='/usr/bin/df'
+readonly ID='/usr/bin/id'
+readonly MV='/usr/bin/mv'
+readonly LN='/usr/bin/ln'
+readonly RM='/usr/bin/rm'
+readonly TR='/usr/bin/tr'
+readonly WC='/usr/bin/wc'
+readonly XZ='/usr/bin/xz'
+readonly AWK='/usr/bin/awk'
+readonly CAT='/usr/bin/cat'
+readonly CMP='/usr/bin/cmp'
+readonly CUT='/usr/bin/cut'
+readonly LDD='/usr/bin/ldd'
+readonly LZ4='/usr/bin/lz4'
+readonly SED='/usr/bin/sed'
+readonly CPIO='/usr/bin/cpio'
+readonly DATE='/usr/bin/date'
+readonly DIFF='/usr/bin/diff'
+readonly ECHO='echo' #built-in instead of /usr/bin/
+readonly FILE='/usr/bin/file'
+readonly FIND='/usr/bin/find'
+readonly GREP='/usr/bin/grep'
+readonly GZIP='/usr/bin/gzip'
+readonly SORT='/usr/bin/sort'
+readonly STAT='/usr/bin/stat'
+readonly TYPE='type' #built-in instead of /usr/bin/
+readonly BTRFS='/usr/bin/btrfs'
+readonly CHOWN='/usr/bin/chown'
+readonly MKDIR='/usr/bin/mkdir'
+readonly LSBLK='/usr/bin/lsblk'
+readonly MOUNT='/usr/bin/mount'
+readonly RMDIR='/usr/bin/rmdir'
+readonly RSYNC='/usr/bin/rsync'
+readonly SLEEP='/usr/bin/sleep'
+readonly TOUCH='/usr/bin/touch'
+readonly UNAME='/usr/bin/uname'
+readonly DEPMOD='/usr/bin/depmod'
+readonly LSATTR='/usr/bin/lsattr'
+readonly MKTEMP='/usr/bin/mktemp'
+readonly PARTED='/usr/bin/parted'
+readonly SFDISK='/usr/bin/sfdisk'
+readonly UMOUNT='/usr/bin/umount'
+readonly BOOTCTL='/usr/bin/bootctl'
+readonly BSDCPIO='/usr/bin/bsdcpio'
+readonly BUSYBOX='/usr/lib/initcpio/busybox'
+readonly DMSETUP='/usr/bin/dmsetup'
+readonly INSTALL='/usr/bin/install' #cp without presevering xattrs
+readonly FINDMNT='/usr/bin/findmnt'
+readonly UDEVADM='/usr/bin/udevadm'
+readonly BASENAME='/usr/bin/basename'
+readonly MODPROBE='/usr/bin/modprobe'
+readonly READLINK='/usr/bin/readlink'
+readonly MKFS_VFAT='/usr/bin/mkfs.vfat'
+readonly PARTPROBE='/usr/bin/partprobe'
+readonly SYSTEMCTL='/usr/bin/systemctl'
+readonly MKFS_BTRFS='/usr/bin/mkfs.btrfs'
+# ------------- 
+readonly HOST_LOCAL="`$UNAME -n`" #network node hostname
+readonly KERNELVERSION=`$UNAME -r` #4.13.12-1-ARCH
+readonly KMODULEDIR=/lib/modules/$KERNELVERSION
+readonly STARTTIME=$SECONDS
+readonly UEFI_BOOTLOADER='/usr/lib/systemd/boot/efi/systemd-bootx64.efi'
+readonly UEFI_BOOTLOADER_BASENAME="`$BASENAME $UEFI_BOOTLOADER`"
+readonly VAR_DIR='/var/lib/drp'
+# not a package: /etc/systemd/system
+# packages:      /usr/lib/systemd/system
+readonly SYSTEMD_DIR='/etc/systemd/system'
+readonly SYSFS_DIR_EFI_VARS='/sys/firmware/efi/efivars'
+readonly EFI_LABEL='RESCUE' # 8 characters
+readonly EFI_PART="/dev/disk/by-label/$EFI_LABEL"
+readonly DESTINATION_DEVICE_FILESYSTEM_LABEL='RESCUE-DATA'
+readonly DATA_PART="/dev/disk/by-label/$DESTINATION_DEVICE_FILESYSTEM_LABEL"
+readonly FAT='16' #in case UEFI firmware doesn't boot from it, change to 32
+# UEFI_PART_SIZE= Absolute minimum "32" for 512 byte sector drives (for FAT"32")
+# UEFI_PART_SIZE= Absolute minimum "256" for Advanced Format 4K Native drives (for FAT"32")
+# Note: "fdisk -l /dev/sdX | grep size" returns Sector size (logical/physical)
+#       or "cat /sys/block/sdX/queue/physical_block_size"
+#          "cat /sys/block/sdX/queue/logical_block_size"
+readonly UEFI_PART_SIZE='200' # MiB; Value will be rounded down according to PARTITION_ALIGN_BLOCK_SIZE chunk
+# PARTITION_ALIGN_BLOCK_SIZE= For cheap flash drives "1" is not enough, use at least "4", safer is "8".
+# Optimizing Linux with cheap flash drives <https://lwn.net/Articles/428584/>
+readonly PARTITION_ALIGN_BLOCK_SIZE='8' # MiB; A too small value will result lower speed and less lifetime of your flash memory device.
+readonly KERNEL_FILE='/boot/vmlinuz-linux'
+readonly INITRAMFS_FILE='initramfs-linux-rescue.img'
+readonly SCRIPT_FILE="`$READLINK -f $( type -p "$0" || $ECHO "$0" )`"
+# required programs, if missing, abort.
+readonly REQUIRED_PROGS=(
+"$SCRIPT_FILE"
+"$BUSYBOX"
+agetty
+awk
+bash
+bootctl
+bsdcpio
+btrfs
+cat
+chattr
+chown
+cmp
+cp
+cpio
+cut
+date
+dd
+depmod
+df
+dhcpcd
+diff
+dmesg
+dmsetup
+dosfsck
+dumpkeys
+efibootmgr
+file
+find
+findfs
+findmnt
+getopt
+grep
+gzip
+install
+ionice
+ip
+join
+kbd_mode
+ldd
+loadkeys
+logger
+lsattr
+lsblk
+mkdir
+mktemp
+modprobe
+mount
+mv
+nice
+parted
+pidof
+pwd
+readlink
+rm
+rmdir
+rsync
+sed
+setsid
+sleep
+sort
+stat
+strings
+stty
+sync
+systemctl
+tar
+touch
+tr
+umount
+uname
+uniq
+wc
+xz
+) #udevadm might me replaceable with findfs to mount by label
+
+readonly COPY_AS_IS=(
+) # /etc/localtime
+#readonly CLONE_GROUPS=( 'input' )
+readonly DIR_FIRMWARE=({/usr,}/lib/firmware/updates {/usr,}/lib/firmware)
+declare -A _addedmodules _modpaths _autodetect_cache
+#TODO: readonly CHECK_CONFIG_FILES=( '/etc/udev/udev.conf' ) # The CHECK_CONFIG_FILES array lists files where changes require the rescue/recovery system to be recreated.
+#recovery system runtime
+readonly SLEEP_DELAY=1 # in seconds
+readonly MAX_RETRIES=5 # 'Could not determine size of disk <device> ...' requires tweaking of this value and SLEEP_DELAY
+readonly LANG_RECOVER='C'
+readonly SSH_ROOT_PASSWORD='drp'
+#NETWORKING_PREPARATION_COMMANDS='dhcpcd eth0'
+readonly MESSAGE_PREFIX='' #"$$: " # Prefix output of this script (not from programs that are called) 
+readonly MASTER_PID=$$ # Keep PID of main process (i.e. the main script that the user had launched as 'drp')
+readonly supported_filesystems='ext2,ext3,ext4,vfat,xfs,reiserfs,btrfs' # Comma separated list of filesystems that is used for "mount/findmnt -t <list,of,filesystems>"
+readonly read_filesystems_command="$FINDMNT -mnrv -o SOURCE,TARGET,FSTYPE,OPTIONS -t $supported_filesystems | $SORT -t ' ' -k 1,1 -u"
+readonly -A pseudofs_types=([anon_inodefs]=1
+                           [autofs]=1
+                           [bdev]=1
+                           [binfmt_misc]=1
+                           [cgroup]=1
+                           [cgroup2]=1
+                           [configfs]=1
+                           [cpuset]=1
+                           [debugfs]=1
+                           [devfs]=1
+                           [devpts]=1
+                           [devtmpfs]=1
+                           [dlmfs]=1
+                           [efivarfs]=1
+                           [fuse.gvfs-fuse-daemon]=1
+                           [fusectl]=1
+                           [hugetlbfs]=1
+                           [mqueue]=1
+                           [nfsd]=1
+                           [none]=1
+                           [nsfs]=1
+                           [overlay]=1
+                           [pipefs]=1
+                           [proc]=1
+                           [pstore]=1
+                           [ramfs]=1
+                           [rootfs]=1
+                           [rpc_pipefs]=1
+                           [securityfs]=1
+                           [sockfs]=1
+                           [spufs]=1
+                           [sysfs]=1
+                           [tmpfs]=1) # generated from util-linux source: libmount/src/utils.c
+# FHS r 3.0 source: https://en.wikipedia.org/wiki/Filesystem_Hierarchy_Standard
+# FHS http://jlk.fjfi.cvut.cz/arch/manpages/man/file-hierarchy.7
+readonly FHS_DIRECTORIES='/bin /boot /dev /etc /etc/opt /etc/sgml /etc/X11 /etc/xml /home /lib* /media /mnt /opt /proc /root /run /run/log /run/user /sbin /srv /sys /tmp /usr /usr/bin /usr/include /usr/lib* /usr/local /usr/sbin /usr/share /usr/share/doc /usr/share/factory/etc /usr/share/factory/var /usr/src /usr/X11R6 /var /var/cache /var/lib /var/lock /var/log /var/mail /var/opt /var/run /var/spool /var/spool/mail /var/tmp'
+readonly MPT_EXCLUDE_FS='anon_inodefs,autofs,bdev,cgroup,cgroup2,configfs,cpuset,debugfs,devfs,devpts,devtmpfs,dlmfs,efivarfs,fuse.gvfs-fuse-daemon,fusectl,hugetlbfs,mqueue,nfsd,none,nsfs,overlay,pipefs,proc,pstore,ramfs,rootfs,rpc_pipefs,securityfs,sockfs,spufs,sysfs,tmpfs' # https://github.com/karelzak/util-linux/blob/master/libmount/src/utils.c
+readonly LOG='rsync.log'
+readonly RSYNC_NICE='ionice -c 3 nice -n 19 rsync'
+# --archive = -rlptgoD (--recurse...--devices)
+readonly RSYNC_OPTIONS='--stats
+  --recursive
+  --links
+  --perms
+  --times
+  --group
+  --owner
+  --devices
+  --specials
+  --hard-links
+  --acls
+  --xattrs
+  --human-readable
+  --inplace
+  --no-whole-file
+  --numeric-ids
+  --delete
+  --delete-excluded'
+#  --progress
+#  --info=progress2
+#  --size-only
+#  --sparse -> cannot be used together with --inplace
+#
+#  --specials --acls  --xattrs --human-readable --inplace --no-whole-file inserted by CJ 8.12.2017
+readonly RSYNC_FILTER='/etc/drp-rsync.conf'
+
+# ------------- the script itself ------------------------------------------
+# Sanitize environment
+export LC_CTYPE='C' LC_ALL='C' LANG='C' #only english
+export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+	# GREP_OPTIONS="--color=always" will break everything
+	# CDPATH can affect cd and pushd
+	# LIBMOUNT_* options can affect findmnt and other tools
+	# Keep PID of main process (i.e. the main script that the user had launched as 'rear'):
+unset -v GREP_OPTIONS CDPATH "${!LIBMOUNT_@}"
+
+# Set some bash options
+shopt -s nullglob extglob # extglob otherwise rm modules.!(xyz) fails
+
+# ------------- functions --------------------------------------------------
+
+# A function to test whether or not its arguments contain at least one 'real value'
+# where 'real value' means to be neither empty nor only blank or control characters.
+# The [:graph:] character class are the visible (a.k.a. printable) characters
+# which is anything except spaces and control characters - i.e. the
+# 7-bit ASCII codes from 0x21 up to 0x7E which are the following
+# alphanumeric characters plus punctuation and symbol characters:
+#  ! " # $ % & ' ( ) * + , - . / 0 1 2 3 4 5 6 7 8 9 : ; < = > ? @
+#  A B C D E F G H I J K L M N O P Q R S T U V W X Y Z [ \ ] ^ _ `
+#  a b c d e f g h i j k l m n o p q r s t u v w x y z { | } ~
+# cf. http://www.regular-expressions.info/posixbrackets.html
+function contains_visible_char() {
+    # The outermost quotation "..." is dispensable in this particular case because
+    # plain 'test' without an argument (i.e. with an empty argument) returns '1'
+    # and here 'test' cannot get more than one argument ('test' for a string of
+    # several non empty words returns '2' with 'bash: test: unary operator expected')
+    # because 'tr' had removed all IFS characters so that 'test' gets at most one word:
+    test "$( $TR -d -c '[:graph:]' <<<"$*" )"
+}
+
+function is_true() {
+    # The argument is usually the value of a variable which needs to be tested
+    # only if there is explicitly a 'true' value then is_true returns true
+    # so that an unset variable or an empty value is not true
+    # and also for any other value that is not recognized as a 'true' value
+    # by the is_true function the is_true function results false:
+    case "$1" in
+      ([tT] | [yY] | [yY][eE][sS] | [tT][rR][uU][eE] | 1)
+        return 0 ;;
+    esac
+    return 1
+}
+
+function is_false() {
+    # The argument is usually the value of a variable which needs to be tested
+    # only if there is explicitly a 'false' value then is_false returns true
+    # so that an unset variable or an empty value is not false
+    # (caution: for unset or empty variables is_false is false)
+    # and also for any other value that is not recognized as a 'false' value
+    # by the is_false function the is_false function results false:
+    case "$1" in
+      ([fF] | [nN] | [nN][oO] | [fF][aA][lL][sS][eE] | 0)
+        return 0 ;;
+    esac
+    return 1
+}
+
+# Pseudofs doesn't need backup because these are auto generated
+function fstype_is_pseudofs() {
+  (( pseudofs_types["$1"] ))
+}
+
+# Check if any of the arguments is executable (logical OR condition).
+# Using plain "type" without any option because has_binary is intended
+# to know if there is a program that one can call regardless if it is
+# an alias, builtin, function, or a disk file that would be executed
+function has_binary() {
+    for bin in $@ ; do
+        # Suppress all output
+        if type $bin &>/dev/null ; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+function PrintError() {
+    $ECHO -e "${MESSAGE_PREFIX}$*" 1>&2 || true
+}
+
+function Error() {
+    PrintError "Error: $*"
+    if caller >/dev/null ; then
+        # Print stack strace in reverse order to the current STDERR
+        (   $ECHO "==== ${MESSAGE_PREFIX}Stack trace ===="
+            local c=0;
+            while caller $((c++)) ; do
+                # nothing to do
+                :
+            done | $AWK ' { l[NR]=$3":"$1" "$2 }
+                         END { for (i=NR; i>0;) print "Trace "NR-i": "l[i--] }
+                       '
+            #$ECHO "${MESSAGE_PREFIX}Message: $*"
+            $ECHO "== ${MESSAGE_PREFIX}End stack trace =="
+        ) 1>&2
+    fi
+    # Make sure Error exits the master process, even if called from child processes:
+    kill -USR1 $MASTER_PID
+}
+
+# If return code is non-zero, bail out:
+function StopIfError() {
+    if (( $? != 0 )) ; then
+        Error "$@"
+    fi
+}
+
+# Exit if there is a bug
+function BugError() {
+    local caller_source="$( CallerSource )"
+    Error "
+====================
+BUG in $caller_source:
+'$@'
+===================="
+}
+
+# For actually intended user messages output to the original STDOUT
+function Print() {
+  $ECHO -e "${MESSAGE_PREFIX}$*" || true
+}
+
+# For normal output messages that are intended for user dialogs.
+function UserOutput() {
+  $ECHO -e "$*" || true
+}
+
+function Log() {
+	# Have a timestamp with nanoseconds precision in any case
+	local timestamp=$( date +"%Y-%m-%d %H:%M:%S.%N " )
+}
+
+# For messages that should appear in the log file and also on the users's terminal
+function LogPrint() {
+  Log "$@"
+  [[ $v ]] && Print "$@"
+}
+
+# For output plus logging that is intended for user dialogs.
+# 'LogUserOutput' belongs to 'UserOutput' like 'LogPrint' belongs to 'Print':
+function LogUserOutput() {
+  Log "$@"
+  UserOutput "$@"
+}
+
+# For messages that should appear in the log file when launched in debug mode and
+# that also appear on the user's terminal
+function DebugPrint() {
+  #Debug "$@"
+  test "$DEBUG" && Print "$@" || true
+}
+
+function map () {
+    local r=0
+    for _ in "${@:2}"; do
+        "$1" "$_" || (( $# > 255 ? r=1 : ++r ))
+    done
+    return $r
+}
+
+function auto_modules() {
+  # Perform auto detection of modules via sysfs.
+  # output includes (lots of) duplicates and excludes filesystems
+
+  local mods=
+
+  mapfile -t mods < <($FIND /sys/devices -name uevent -exec $SORT -u {} + | $AWK -F= '$1 == "MODALIAS" && !_[$0]++')
+  mapfile -t mods < <($MODPROBE -qaR "${mods[@]#MODALIAS=}")
+
+  (( ${#mods[*]} )) && printf '%s\n' "${mods[@]//-/_}"
+}
+
+function add_dir() {
+  # add a directory (with parents) to $BUILDROOT
+  #   $1: pathname on initcpio
+  #   $2: mode (optional), default 755
+
+  if [[ -z $1 || $1 != /?* ]]; then
+      return 1
+  fi
+
+  local path=$1 mode=${2:-755}
+
+  if [[ -d $ROOTFS_DIR$1 ]]; then
+      # ignore dir already exists
+      return 0
+  fi
+
+  LogPrint "adding dir: %s" "$path"
+  command $INSTALL -v -dm$mode "$ROOTFS_DIR$path" | while read -r line; do
+    [[ $line = *'install: creating directory '* ]] || continue
+    line=${line#*\'}
+    line=${line%\'*}
+    #$TOUCH -r "$KERNEL_FILE" "$line" "$line/.."
+  done
+}
+
+function add_symlink() {
+  # Add a symlink to the initcpio image. There is no checking done
+  # to ensure that the target of the symlink exists.
+  #   $1: pathname of symlink on image
+  #   $2: absolute path to target of symlink (optional, can be read from $1)
+  local name=$1 target=$2
+
+  (( $# == 1 || $# == 2 )) || return 1
+
+  if [[ -z $target ]]; then
+    target=$($READLINK -f "$name")
+    if [[ -z $target ]]; then
+        Error 'invalid symlink: %s' "$name"
+        return 1
+    fi
+  fi
+
+  add_dir "${name%/*}"
+
+  if [[ -L $ROOTFS_DIR$1 ]]; then
+      LogPrint "overwriting symlink %s -> %s" "$name" "$target"
+  else
+      LogPrint "adding symlink: %s -> %s" "$name" "$target"
+  fi
+  $LN -sfn "$target" "$ROOTFS_DIR$name"
+
+  # Only for FILEs not folders
+  if [[ -f "$ROOTFS_DIR$name" ]]; then
+    # helper to point to correct reference
+    case $target in
+      (busybox) target=/usr/lib/initcpio/busybox ;;
+      (*) target=/usr/bin/$target ;;
+    esac
+    # Copy access and modification times
+    $TOUCH --no-create --no-dereference --reference="$target" "$ROOTFS_DIR$name"
+  fi
+}
+
+function add_file() {
+    # Add a plain file to the initcpio image. No parsing is performed and only
+    # the singular file is added.
+    #   $1: path to file
+    #   $2: destination on initcpio (optional, defaults to same as source)
+    #   $3: mode
+
+    (( $# )) || return 1
+
+    # determine source and destination
+    local src=$1 dest=${2:-$1} mode= line=
+
+    if [[ ! -f $src ]]; then
+        Error "file not found: \`%s'" "$src"
+        return 1
+    fi
+
+    mode=${3:-$($STAT -c %a "$src")}
+    if [[ -z $mode ]]; then
+        Error "failed to stat file: \`%s'." "$src"
+        return 1
+    fi
+
+    if [[ -e $ROOTFS_DIR$dest ]]; then
+        LogPrint "overwriting file: %s" "$dest"
+    else
+        LogPrint "adding file: %s" "$dest"
+    fi
+    #command install 
+    $INSTALL -Dm$mode --preserve-timestamps -v "$src" "$ROOTFS_DIR$dest" | while read -r line; do
+      if [[ $line = *'install: creating directory '* ]]; then
+        # set the created directory to the timestamp of $src
+        line=${line#*\'} # parameter expansion matched against start
+        line=${line%\'*} # parameter expansion matched against end
+        $TOUCH --reference="$src" "$line"
+        #echo "touch --reference=$src $line"
+      fi
+    done
+}
+
+function add_full_dir() {
+    # Add a directory and all its contents, recursively, to the initcpio image.
+    # No parsing is performed and the contents of the directory is added as is.
+    #   $1: path to directory
+    #   $2: glob pattern to filter file additions (optional)
+    #   $3: path prefix that will be stripped off from the image path (optional)
+
+    local f= filter=${2:-*} strip_prefix=$3
+
+    if [[ -n $1 && -d $1 ]]; then
+        add_dir "$1"
+
+        for f in "$1"/*; do
+            if [[ -L $f ]]; then
+                if [[ $f = $filter ]]; then
+                    add_symlink "${f#$strip_prefix}" "$($READLINK "$f")"
+                fi
+            elif [[ -d $f ]]; then
+                add_full_dir "$f" "$filter" "$strip_prefix"
+            elif [[ -f $f ]]; then
+                if [[ $f = $filter ]]; then
+                    add_file "$f" "${f#$strip_prefix}"
+                fi
+            fi
+        done
+    fi
+}
+
+function add_binary() {
+    # Add a binary file to the initcpio image. library dependencies will
+    # be discovered and added.
+    #   $1: path to binary
+    #   $2: destination on initcpio (optional, defaults to same as source)
+
+    local -a sodeps
+    local line= regex= binary= dest= mode= sodep= resolved=
+
+    if [[ ${1:0:1} != '/' ]]; then
+      binary=$($TYPE -P "$1")
+    else
+      binary=$1
+    fi
+
+    if [[ ! -f $binary ]]; then
+      Error "file not found: \`%s'" "$1"
+      return 1
+    fi
+
+    dest=${2:-$binary}
+    mode=$($STAT -c %a "$binary")
+
+    # always add the binary itself
+    add_file "$binary" "$dest" "$mode"
+
+    # negate this so that the RETURN trap is not fired on non-binaries
+    ! lddout=$($LDD "$binary" 2>/dev/null) && return 0
+
+    # resolve sodeps
+    regex='^(|.+ )(/.+) \(0x[a-fA-F0-9]+\)'
+    while read -r line; do
+      if [[ $line =~ $regex ]]; then
+        sodep=${BASH_REMATCH[2]}
+      elif [[ $line = *'not found' ]]; then
+        Error "binary dependency \`%s' not found for \`%s'" "${line%% *}" "$1"
+        (( ++_builderrors ))
+        continue
+      fi
+
+      if [[ -f $sodep && ! -e $ROOTFS_DIR$sodep ]]; then
+        add_file "$sodep" "$sodep" "$($STAT -Lc %a "$sodep")"
+      fi
+    done <<< "$lddout"
+
+    # handle binary quirks
+    #tools like equery and strace prove to be most helpful to find these dependencies
+	  case $binary in
+	    ('/usr/sbin/nano')
+	      add_file '/usr/share/terminfo/l/linux'
+        add_file '/usr/share/terminfo/x/xterm-color' # ssh nano
+	      ;;
+	  esac
+
+    return 0
+}
+
+function all_modules() {
+  # Add modules to the initcpio, filtered by grep.
+  #   $@: filter arguments to grep
+
+  local -i count=0
+  local mod=
+
+  [[ $KERNELVERSION == none ]] && return 0
+
+  while read -r -d '' mod; do
+    (( ++count ))
+
+    mod=${mod##*/}
+    mod="${mod%.ko*}"
+    printf '%s\n' "${mod//-/_}"
+  done < <($FIND "$KMODULEDIR" -name '*.ko*' -print0 2>/dev/null | grep -EZz "$@")
+
+  (( count ))
+}
+
+function add_if_avail() {
+  local r= resolved=()
+
+  # treat this as an alias, since ext3 might be aliased to ext4. also, as
+  # of linux 3.9, we can find any filesystem by the alias "fs-$name"
+  # rather than having to guess at the corresponding module name.
+  mapfile -t resolved < <(modprobe -Ra {fs-,}"$1" 2>/dev/null)
+
+  for r in "${resolved[@]}"; do
+    _autodetect_cache["$r"]=1
+  done
+}
+
+function add_autodetected_modules() {
+  # Add modules to the initcpio, filtered by the list of autodetected
+  # modules.
+  #   $@: arguments to all_modules
+
+  local mod mods
+
+  [[ $KERNELVERSION == none ]] && return 0
+
+  if (( ${#_autodetect_cache[*]} )); then
+  		# intersect existing module files with detected modules
+      mapfile -t mods < <(all_modules "$@" | grep -xFf <(printf '%s\n' "${!_autodetect_cache[@]}"))
+      map add_module "${mods[@]}"
+      return $(( !${#mods[*]} ))
+  else
+      Error 'Code logic error: _autodetect_cache is empty'
+  fi    
+}
+
+function add_firmware() {
+  # add a firmware file to the image.
+  #   $1: firmware path fragment
+
+  local fw fwpath r=1
+
+  for fw; do
+    for fwpath in "${DIR_FIRMWARE[@]}"; do
+      if [[ -f $fwpath/$fw ]]; then
+        add_file "$fwpath/$fw" "$fwpath/$fw" 644 && r=0
+        break
+      fi
+    done
+  done
+
+  return $r
+}
+
+function add_module() {
+  # Add a kernel module to the initcpio image. Dependencies will be
+  # discovered and added.
+  #   $1: module name
+
+  local target= module= softdeps= deps= field= value= firmware=()
+  local ign_errors=0 found=0
+
+  [[ $KERNELVERSION == none ]] && return 0
+
+  if [[ $1 = *\? ]]; then
+      ign_errors=1
+      set -- "${1%?}"
+  fi
+
+  target=${1%.ko*} target=${target//-/_}
+
+  # skip expensive stuff if this module has already been added
+  (( _addedmodules["$target"] == 1 )) && return
+
+  while IFS=':= ' read -r -d '' field value; do
+      case "$field" in
+          (filename)
+              found=1
+              module=${value##*/} module=${module%.ko*}
+              LogPrint "adding module: %s" "$module"
+              _modpaths["$value"]=1
+              _addedmodules["${module//-/_}"]=1
+              ;;
+          (depends)
+              IFS=',' read -r -a deps <<< "$value"
+              map add_module "${deps[@]}"
+              ;;
+          (firmware)
+              firmware+=("$value")
+              ;;
+          (softdep)
+              read -ra softdeps <<<"$value"
+              for module in "${softdeps[@]}"; do
+                  [[ $module == *: ]] && continue
+                  add_module "$module?"
+              done
+              ;;
+      esac
+  done < <(modinfo -b "$_optmoduleroot" -k "$KERNELVERSION" -0 "$target" 2>/dev/null)
+
+  if (( !found )); then
+      (( ign_errors || _addedmodules["$target"] )) && return 0
+      error "module not found: \`%s'" "$target"
+      return 1
+  fi
+
+  if (( ${#firmware[*]} )); then
+      add_firmware "${firmware[@]}" ||
+          warning 'Possibly missing firmware for module: %s' "$target"
+  fi
+
+  # handle module quirks
+  case $target in
+      (fat)
+          add_module "nls_cp437?"
+          add_module "nls_iso8859-1?"
+          ;;
+      (ocfs2)
+          add_module "configfs?"
+          ;;
+      (btrfs)
+          add_module "libcrc32c?"
+          ;;
+      (f2fs)
+          add_module "crypto-crc32?"
+          ;;
+      (ext4)
+          add_module "crypto-crc32c?"
+          ;;
+  esac
+}
+
+function install_modules() {
+    local m moduledest=$ROOTFS_DIR/lib/modules/$KERNELVERSION
+    local -a xz_comp gz_comp
+
+    [[ $KERNELVERSION == none ]] && return 0
+
+    if (( $# == 0 )); then
+      Error 'No modules were added to the image. This is probably not what you want.'
+      return 0
+    fi
+
+    $CP $v "$@" "$moduledest/kernel"
+
+    # unzip modules prior to recompression
+    for m in "$@"; do
+      case $m in
+        (*.xz)
+          xz_comp+=("$moduledest/kernel/${m##*/}")
+          ;;
+        (*.gz)
+          gz_comp+=("$moduledest/kernel/${m##*/}")
+          ;;
+      esac
+    done
+    (( ${#xz_comp[*]} )) && $XZ -d "${xz_comp[@]}"
+    (( ${#gz_comp[*]} )) && $GZIP -d "${gz_comp[@]}"
+
+    #$TOUCH -cr "$KERNEL_FILE" "$moduledest/kernel/"{,*} #,..}
+
+    LogPrint 'Generating module dependencies'  
+    #                  target-directory    source
+    $INSTALL -m644 $v -t "$moduledest" "$KMODULEDIR"/modules.builtin
+
+    # we install all modules into kernel/, making the .order file incorrect for
+    # the module tree. munge it, so that we have an accurate index. This avoids
+    # some rare and subtle issues with module loading choices when an alias
+    # resolves to multiple modules, only one of which can claim a device.
+    # kernel/arch/x86/events/amd/power.ko -> kernel/power.ko
+    $AWK -F'/' '{ print "kernel/" $NF }' "$KMODULEDIR"/modules.order >"$moduledest/modules.order"
+
+    $DEPMOD -b "$ROOTFS_DIR" "$KERNELVERSION"
+
+    # remove all non-binary module.* files (except devname for on-demand module loading)
+    $RM $v "$moduledest"/modules.!(*.bin|devname|softdep)
+    #$TOUCH --no-create --reference="$KERNEL_FILE" "$moduledest"/modules.{*.bin,devname,softdep}
+}
+
+function copy_openssh_keys() {
+	local return_code=1
+	local keytype keyfile
+	
+	umask 0022
+	[[ -d '/etc/dropbear' ]] && $MKDIR -p '/etc/dropbear'
+
+	for cipher in 'rsa' 'dss' 'ecdsa'; do
+		keyfile="/etc/ssh/ssh_host_${keytype}_key"
+		if [[ -s "$keyfile" ]]; then
+			/usr/bin/dropbearconvert 'openssh' 'dropbear' "${keyfile}" "/etc/dropbear/dropbear_${keytype}_host_key" >/dev/null
+			return_code=0
+		fi
+	done
+
+	return $return_code
+}
+
+function generate_dropbear_keys() {
+  local keyfile keytype
+
+  for keytype in 'rsa' 'dss' 'ecdsa' ; do
+      keyfile="/etc/dropbear/dropbear_${keytype}_host_key"
+      if [ ! -s "$keyfile" ]; then
+			  LogPrint "Generating ${keytype} host key for dropbear SSH server."
+			  /usr/bin/dropbearkey -t "${keytype}" -f "${keyfile}" >/dev/null
+      fi
+  done
+}
+
+# Get the size in bytes of a disk/partition.
+# For partitions, use "sda/sda1" as argument.
+function get_disk_size() {
+  local disk_name=$1
+  local block_size=$(get_block_size ${disk_name%/*})
+
+  retry_command test -r /sys/block/$disk_name/size || Error "Could not determine size of disk $disk_name"
+
+  local nr_blocks=$( < /sys/block/$disk_name/size)
+  local disk_size=$(( nr_blocks * block_size ))
+
+  ### Make sure we always return a number
+  echo $(( disk_size ))
+}
+
+# Get the block size of a disk.
+function get_block_size() {
+    # Only newer kernels have an interface to get the block size
+    if [ -r /sys/block/$1/queue/logical_block_size ] ; then
+        echo $( < /sys/block/$1/queue/logical_block_size)
+    else
+        echo '512'
+    fi
+}
+
+### Translate a sysfs name or device name to the preferred name
+### The device does not necessarily exist.
+###     cciss!c0d0 -> /dev/cciss/c0d0
+###     /dev/dm-3 -> /dev/mapper/system-tmp
+###     /dev/dm-4 -> /dev/mapper/oralun
+###     /dev/dm-5 -> /dev/mapper/oralunp1
+function get_device_name() {
+  ### strip common prefixes
+  local name=${1#/dev/}
+  name=${name#/sys/block/}
+
+  contains_visible_char "$name" || BugError 'Empty string passed to function get_device_name'
+
+  ### Translate dm-8 -> mapper/test
+  local device dev_number mapper_number
+  if [[ -d /sys/block/$name ]] ; then
+    if [[ -r /sys/block/$name/dm/name ]] ; then
+      ### recent kernels have a dm subfolder
+      echo "/dev/mapper/$( < /sys/block/$name/dm/name)";
+      return 0
+    else
+      ### loop over all block devices
+      dev_number=$( < /sys/block/$name/dev)
+      for device in /dev/mapper/* ; do
+        mapper_number=$($DMSETUP info -c --noheadings -o major,minor ${device#/dev/mapper/} 2>/dev/null )
+        if [ "$dev_number" = "$mapper_number" ] ; then
+          echo "$device"
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  ### Translate device name to mapper name. ex: vg/lv -> mapper/vg-lv
+  if [[ "$name" =~ ^mapper/ ]]; then
+    echo "/dev/$name"
+    return 0
+  fi
+  if my_dm=`$READLINK /dev/$name`; then
+   for mapper_dev in /dev/mapper/*; do
+     if mapper_dm=`$READLINK $mapper_dev`; then
+      if [ "$my_dm" = "$mapper_dm" ]; then
+       echo $mapper_dev
+       return 0
+      fi
+     fi
+   done
+  fi
+
+  ### handle cciss sysfs naming
+  name=${name//!//}
+
+  ### just return the possibly nonexisting name
+  echo "/dev/$name"
+  return 1
+}
+
+function is_multipath_path {
+  [ "$1" ] && type multipath &>/dev/null && multipath -c /dev/$1 &>/dev/null
+}
+
+### ciss-3600508b1001fffffa004f7b3f209000b-part2 -> cciss/c0d0p2
+# see rear issue #305
+function get_device_mapping() {
+    if [[ ! -s "${TMP_DIR}/recovery/diskbyid_mappings" ]]; then
+        echo $1
+    else
+        local name=${1##*/}      # /dev/disk/by-id/scsi-xxxx -> scsi-xxx
+        local disk_name=$(grep -w "^${name}" ${TMP_DIR}/recovery/diskbyid_mappings | awk '{print $2}')
+        if [[ -z "$disk_name" ]]; then
+            echo $1
+        else
+            echo "$disk_name"
+        fi
+    fi
+}
+
+# retry_command () is binded with SLEEP_DELAY and MAX_RETRIES.
+# This function will do maximum of MAX_RETRIES command execution
+# and will sleep SLEEP_DELAY after each unsuccessful command execution.
+# It outputs command stdout if succeeded or returns 1 on failure.
+function retry_command()
+{
+    local retry=0
+
+    until command_stdout=$(eval "$@"); do
+        sleep $SLEEP_DELAY
+
+        let retry++
+
+        if (( retry >= MAX_RETRIES )) ; then
+            Log "retry_command '$*' failed"
+            return 1
+        fi
+    done
+    # Have no additional trailing newline for the command stdout:
+    echo -n "$command_stdout"
+}
+
+# Translate a device name to a sysfs name.
+function get_sysfs_name() {
+  local name=${1#/dev/}
+  name=${name#/sys/block/}
+
+  if [[ -e /sys/block/${name//\//!} ]] ; then
+    echo "${name//\//!}"
+    return 0
+  fi
+
+  ### Follow symlinks.
+  if [[ -h /dev/$name ]] ; then
+    local target=$($READLINK -f "/dev/$name")
+    if [[ -e /sys/block/${target#/dev/} ]] ; then
+      echo "${target#/dev/}"
+      return 0
+    fi
+  fi
+
+  # Accommodate for mapper/test -> dm-? mapping.
+  local dev_number=$($DMSETUP info -c --noheadings -o major,minor ${name##*/} 2>/dev/null )
+  if [[ "$dev_number" ]] ; then
+    local dev_name sysfs_device
+    for sysfs_device in /sys/block/*/dev ; do
+      if [[ "$dev_number" = "$( < $sysfs_device)" ]] ; then
+        dev_name=${sysfs_device#/sys/block/}
+        echo "${dev_name%/*}"
+        return 0
+      fi
+    done
+  fi
+
+  # Otherwise, it can be the case that we just want to translate the name.
+  echo "${name//\//!}"
+  return 1
+}
+
+# Extract partitioning information of device $1 (full device path)
+# format : part <partition size(bytes)> <partition start(bytes)> <partition type|name> <flags> /dev/<partition>
+function extract_partitions() {
+  local -r device=$1
+	local -r sysfs_name=$(get_sysfs_name $device)
+
+  ### check if we can find any partitions
+  local -a sysfs_paths=(/sys/block/$sysfs_name/$sysfs_name*)
+  local path sysfs_path
+  if [[ ${#sysfs_paths[@]} -eq 0 ]] ; then
+    ### try to find partitions like /dev/mapper/datalun1p1
+    if [[ ${device/mapper//} != ${device} ]] ; then
+      for path in ${device}p[0-9]* ${device}[0-9] ${device}-part* ${device}_part*; do
+        sysfs_path=$(get_sysfs_name $path)
+        if [[ "$sysfs_path" ]] && [[ -e "/sys/block/$sysfs_path" ]] ; then
+          sysfs_paths=( "${sysfs_paths[@]}" "/sys/block/$sysfs_path" )
+        fi
+      done
+    fi
+  fi
+
+  ### collect basic information
+  : > $TMP_DIR/partitions_unsorted
+
+  local partition_name partition_prefix start_block
+  local partition_nr size start
+  for path in "${sysfs_paths[@]}" ; do
+    ### path can be: /sys/block/sda/sda1 --> /dev/sda1
+    ###              /sys/block/dm-4 --> /dev/mapper/mpathbp1
+    partition_name=$(get_device_name ${path##*/})
+    ### strip prefixes
+    partition_name=${partition_name#/dev/}
+    partition_name=${partition_name#mapper/}
+
+    partition_nr=$(get_partition_number "$partition_name")
+
+    partition_prefix=${partition_name%$partition_nr}
+
+    size=$(get_disk_size ${path#/sys/block/})
+    start=$(get_partition_start ${path#/sys/block/})
+
+    echo "$partition_nr $size $start">> $TMP_DIR/partitions_unsorted
+  done
+
+  # do a numeric sort to have the partitions in numeric order (see #352)
+  # add a uniq sort "-u" to filter duplicated lines (see #1301)
+  $SORT -un  $TMP_DIR/partitions_unsorted > $TMP_DIR/partitions
+
+  if [[ ! -s $TMP_DIR/partitions ]] ; then
+    Debug "No partitions found on $device."
+    return
+  fi
+
+  ### Cache parted data
+  local disk_label
+  if [[ $FEATURE_PARTED_MACHINEREADABLE ]] ; then
+    $PARTED -m -s $device print > $TMP_DIR/parted
+    disk_label=$($GREP ^/ $TMP_DIR/parted | $CUT -d ':' -f '6')
+  else
+    $PARTED -s $device print > $TMP_DIR/parted
+    disk_label=$($GREP -E 'Partition Table|Disk label' $TMP_DIR/parted | $CUT -d ':' -f '2' | $TR -d ' ')
+  fi
+
+  $CP $TMP_DIR/partitions $TMP_DIR/partitions-data
+
+  local type
+
+  ### determine partition type for msdos partition tables
+  if [[ "$disk_label" = 'msdos' ]] ; then
+    local -i has_logical
+    while read partition_nr size start junk ; do
+      if (( $partition_nr > 4 )) ; then
+        ### logical
+        has_logical=1
+        $SED -i /^$partition_nr\ /s/$/\ logical/ $TMP_DIR/partitions
+      else
+        ### set to primary until flags are known
+        local type='primary'
+        $SED -i /^$partition_nr\ /s/$/\ primary/ $TMP_DIR/partitions
+      fi
+    done < $TMP_DIR/partitions-data
+  fi
+
+  ### find partition name for gpt disks.
+  # For the SUSE specific gpt_sync_mbr partitioning scheme
+  # see https://github.com/rear/rear/issues/544
+  if [[ "$disk_label" = 'gpt' || "$disk_label" == 'gpt_sync_mbr' ]] ; then
+    if [[ "$FEATURE_PARTED_MACHINEREADABLE" ]] ; then
+      while read partition_nr size start junk ; do
+        type=$($GREP "^$partition_nr:" $TMP_DIR/parted | $CUT -d ':' -f '6')
+        if [[ -z "$type" ]] ; then
+          type='drp-noname'
+        fi
+        type=$(echo "$type" | $SED -e 's/ /0x20/g') # replace spaces with 0x20 in name field
+        $SED -i /^$partition_nr\ /s/$/\ $type/ $TMP_DIR/partitions
+      done < $TMP_DIR/partitions-data
+    else
+      local line line_length number numberfield
+      init_columns "$($GREP 'Flags' $TMP_DIR/parted)"
+      while read line ; do
+        # read throws away leading spaces
+        line_length=${line%% *}
+        if (( "$line_length" < 10 )) ; then
+          line=" $line"
+        fi
+
+        if [[ "$FEATURE_PARTED_OLDNAMING" ]] ; then
+          numberfield='minor'
+        else
+          numberfield='number'
+        fi
+
+        number=$(get_columns "$line" "$numberfield" | $TR -d ' ' | $TR -d ';')
+        type=$(get_columns "$line" 'name' | $TR -d ' ' | $TR -d ';')
+
+        if [[ -z "$type" ]] ; then
+          type='drp-noname'
+        fi
+
+        type=$(echo "$type" | $SED -e 's/ /0x20/g')
+        $SED -i /^$number\ /s/$/\ $type/ $TMP_DIR/partitions
+      done < <($GREP -E '^[ ]*[0-9]' $TMP_DIR/parted)
+    fi
+  fi
+
+  ### find the flags given by parted.
+  local flags flaglist
+  if [[ "$FEATURE_PARTED_MACHINEREADABLE" ]] ; then
+    while read partition_nr size start junk ; do
+      flaglist=$($GREP "^$partition_nr:" $TMP_DIR/parted | $CUT -d ':' -f '7' | $TR -d ',' | $TR -d ';')
+
+      ### only report flags parted can actually recreate
+      flags=''
+      for flag in $flaglist ; do
+        if [[ "$flag" = boot || "$flag" = esp || "$flag" = root || "$flag" = swap || "$flag" = hidden || "$flag" = raid || "$flag" = lvm || "$flag" = lba || "$flag" = palo || "$flag" = legacy_boot || "$flag" = bios_grub || "$flag" = prep ]] ; then
+            flags="$flags$flag,"
+        elif [[ "$flag" = 'type=06' ]] ; then
+            flags="${flags}prep,"
+        fi
+      done
+
+      if [[ -z "$flags" ]] ; then
+        flags='none'
+      fi
+      sed -i /^$partition_nr\ /s/$/\ ${flags%,}/ $TMP_DIR/partitions
+    done < $TMP_DIR/partitions-data
+  else
+    local line line_length number numberfield
+    init_columns "$($GREP "Flags" $TMP_DIR/parted)"
+    while read line ; do
+      # read throws away leading spaces
+      line_length=${line%% *}
+      if (( "$line_length" < 10 )) ; then
+        line=" $line"
+      fi
+
+      if [[ "$FEATURE_PARTED_OLDNAMING" ]] ; then
+        numberfield='minor'
+      else
+        numberfield='number'
+      fi
+
+      number=$(get_columns "$line" "$numberfield" | $TR -d ' ' | $TR -d ';')
+      flaglist=$(get_columns "$line" 'flags' | $TR -d ',' | $TR -d ';')
+
+      ### only report flags parted can actually recreate
+      flags=''
+      for flag in $flaglist ; do
+        if [[ "$flag" = boot || "$flag" = root || "$flag" = swap || "$flag" = hidden || "$flag" = raid || "$flag" = lvm || "$flag" = lba || "$flag" = palo || "$flag" = legacy_boot || "$flag" = bios_grub || "$flag" = prep ]] ; then
+          flags="$flags$flag,"
+        elif [[ "$flag" = 'type=06' ]] ; then
+          flags="${flags}prep,"
+        fi
+      done
+
+      if [[ -z "$flags" ]] ; then
+        flags='none'
+      fi
+
+      $SED -i /^$number\ /s/$/\ ${flags%,}/ $TMP_DIR/partitions
+    done < <($GREP -E '^[ ]*[0-9]' $TMP_DIR/parted)
+  fi
+
+  ### Find an extended partition if there is one
+  if [[ "$disk_label" = 'msdos' ]] && [[ "$has_logical" ]] ; then
+    cp $TMP_DIR/partitions $TMP_DIR/partitions-data
+    while read partition_nr size start type flags junk ; do
+      (( $partition_nr > 4 )) && continue
+
+      if has_binary $SFDISK ; then
+        # make sfdisk output safe against unwanted characters (in particular blanks)
+        # cf. https://github.com/rear/rear/issues/1106
+        declare partition_id=$( $SFDISK -c $device $partition_nr 2>/dev/null | tr -c -d '[:alnum:]' )
+        ### extended partitions are either DOS_EXT, EXT_LBA or LINUX_EXT
+        if [[ "$partition_id" = 5 || "$partition_id" = f || "$partition_id" = 85 ]]; then
+          $SED -i /^$partition_nr\ /s/\ primary\ /\ extended\ / $TMP_DIR/partitions
+        fi
+      else
+        if [[ "${flags/lba/}" != "$flags" ]] ; then
+          $SED -i /^$partition_nr\ /s/\ primary\ /\ extended\ / $TMP_DIR/partitions
+        fi
+      fi
+    done < $TMP_DIR/partitions-data
+  fi
+
+  ### Write to layout file
+  while read partition_nr size start type flags junk ; do
+    ### determine the name of the partition using the number
+    ### device=/dev/cciss/c0d0 ; partition_prefix=cciss/c0d0p
+    ### device=/dev/md127 ; partition_prefix=md127p
+    ### device=/dev/sda ; partition_prefix=sda
+    ### device=/dev/mapper/mpathbp1 ; partition_prefix=mpathbp
+    partition_name="${device%/*}/${partition_prefix#*/}$partition_nr"
+    echo "part $device $size $start $type $flags $(get_device_name $partition_name)"
+  done < $TMP_DIR/partitions
+}
+
+# Function returns partition number of partition block device name
+#
+# This function should support:
+#   /dev/mapper/36001438005deb05d0000e00005c40000p1
+#   /dev/mapper/36001438005deb05d0000e00005c40000_part1
+#   /dev/sda1
+#   /dev/cciss/c0d0p1
+#
+# Requires: grep v2.5 or higher (option -o)
+function get_partition_number() {
+  local partition=$1
+  local number=$(echo "$partition" | $GREP -o -E "[0-9]+$")
+
+  # Test if $number is a positive integer, if not it is a bug
+  [ $number -gt 0 ] 2>/dev/null
+  StopIfError "Partition number '$number' of partition $partition is not a valid number."
+
+  # Catch if $number is too big, report it as a bug
+  (( $number <= 128 ))
+  StopIfError "Partition $partition is numbered '$number'. More than 128 partitions is not supported."
+
+  echo $number
+}
+
+# Returns partition start block or 'unknown'
+# sda/sda1 or
+# dm-XX
+function get_partition_start() {
+  local disk_name=$1
+  local start_block start
+
+  local block_size=$(get_block_size ${disk_name%/*})
+
+  if [[ -r /sys/block/$disk_name/start ]] ; then
+    start_block=$(< $path/start)
+  elif [[ $disk_name =~ ^dm- ]]; then
+    # /dev/mapper/mpath4-part1
+    local devname=$(get_device_name $disk_name)
+    devname=${devname#/dev/mapper/}
+
+    # 0 536846303 linear 253:7 536895488
+    read junk junk junk junk start_block < <( $DMSETUP table ${devname} 2>/dev/null )
+  fi
+  if [[ -z $start_block ]]; then
+    Log "Could not determine start of partition $partition_name."
+    start='unknown'
+  else
+    start=$(( start_block * block_size ))
+  fi
+
+  echo $start
+}
+
+function set_separator() {
+  OIFS=$IFS
+  IFS="$1"
+}
+
+function restore_separator() {
+  IFS=$OIFS
+}
+
+columns=
+# produces a list of header=end pairs in $columns
+function init_columns() {
+  local line=$1
+  columns=''
+
+  local word=''
+  local wasspace=''
+  local len=${#line}
+  local i=0
+  while (( $i < $len )) ;
+  do
+    local char="${line:$i:1}"
+    if [[ "$wasspace" ]] && [[ "$char" = ' ' ]] ;then
+      if [[ "$word" ]] ; then
+        # word complete, write to list
+        let start=$i-${#word}
+        word=$( echo "$word" | tr '[:upper:]' '[:lower:]')
+
+        columns="$columns${word%% }=$start;"
+        word=""
+      fi
+    else
+      word="${word}${char}"
+    fi
+
+    if [[ "$char" = ' ' ]] ; then
+      wasspace='yes'
+    else
+      wasspace=''
+    fi
+
+    let i++
+  done
+  # last word
+  let start=$i-${#word}
+  word=$( echo "$word"| tr '[:upper:]' '[:lower:]')
+  columns="$columns${word%% }=$start;"
+
+  #echo "c:$columns"
+}
+
+# get_columns $line $header1 $header2
+# print the contents of the columns, separated by ;
+function get_columns() {
+  local line=$1
+  shift
+
+  local headers=$@
+  local value=''
+  for header in $headers ; do
+      local start=$(get_column_start "$header")
+      local size=$(get_column_size "$header")
+      #echo "$header $start $size"
+      value="$value${line:$start:$size};"
+  done
+  echo "$value"
+}
+
+# get_column_size $header
+function get_column_size() {
+  local start=$(get_column_start "$1")
+
+  local nextheader=$(get_next_header "$1")
+  if [[ -z "$nextheader" ]] ; then
+    echo '255'
+    return 0
+  fi
+  local end=$(get_column_start "$nextheader")
+  let local size=$end-$start
+  echo "$size"
+}
+
+# get_column_start $header
+function get_column_start() {
+  local pair
+  set_separator ';'
+  for pair in $columns ; do
+    local header=${pair%=*}
+    local hstart=${pair#*=}
+
+    if [[ "$header" = "$1" ]] ; then
+      echo "$hstart"
+      restore_separator
+      return 0
+    fi
+  done
+  restore_separator
+  return 1
+}
+
+# get_next_header $header
+function get_next_header() {
+  local pair
+  local previous
+  set_separator ';'
+  for pair in $columns ; do
+    local header=${pair%=*}
+    local hstart=${pair#*=}
+
+    if [[ "$previous" = "$1" ]] ; then
+      echo "$header"
+      restore_separator
+      return 0
+    fi
+
+    previous=$header
+  done
+  restore_separator
+  return 1
+}
+
+# Generate dependencies in $DISKLAYOUT_DEPS between disks as found in $DISKLAYOUT_FILE.
+# Also generate a list of disks to be restored in $DISKLAYOUT_TODO.
+function generate_layout_dependencies() {
+  : > $DISKLAYOUT_DEPS # is a list of: <item> <depends on>
+  : > $DISKLAYOUT_TODO # is a list of: [todo|done] <type> <item>
+
+  local type dev remainder name disk disks vgrp dm_vgrp lvol dm_lvol part mp fs bd nmp temp_nm
+  while read type remainder ; do
+    case $type in
+      (disk)
+        #TODO: replace $(echo subprocesses by parameter expansion
+        name=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        add_component "$name" "disk"
+        ;;
+      (part)
+        # disk is the first field of the remainder
+        disk=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        name=$(echo "$remainder" | $CUT -d ' ' -f '6')
+        add_dependency "$name" "$disk"
+        add_component "$name" 'part'
+        ;;
+      (lvmgrp)
+        name=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        add_component "$name" 'lvmgrp'
+        ;;
+      (lvmdev)
+        vgrp=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        part=$(echo "$remainder" | $CUT -d ' ' -f '2')
+        add_dependency "$vgrp" "pv:$part"
+        add_dependency "pv:$part" "$part"
+        add_component "pv:$part" 'lvmdev'
+        ;;
+      (lvmvol)
+        vgrp=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        lvol=$(echo "$remainder" | $CUT -d ' ' -f '2')
+        dm_vgrp=${vgrp//-/--} # Vgs and Lvs containing - in their name have a double dash in DM
+        dm_lvol=${lvol//-/--}
+        add_dependency "/dev/mapper/${dm_vgrp#/dev/}-$dm_lvol" "$vgrp"
+        add_component "/dev/mapper/${dm_vgrp#/dev/}-$dm_lvol" 'lvmvol'
+        ;;
+      (raid)
+        name=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        disks=( $(echo "$remainder" | $SED -r "s/.*devices=([^ ]+).*/\1/" | $TR ',' ' ') )
+        for disk in "${disks[@]}" ; do
+            add_dependency "$name" "$disk"
+        done
+        add_component "$name" 'raid'
+        ;;
+      (fs|btrfsmountedsubvol)
+        dev=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        mp=$(echo "$remainder" | $CUT -d ' ' -f '2')
+        add_dependency "$type:$mp" "$dev"
+        add_component "$type:$mp" "$type"
+        # find dependencies on other filesystems
+        while read dep_type bd dep_mp junk; do
+          if [ "$dep_mp" != '/' ] ; then
+            # make sure we only match complete paths
+            # e.g. not /data as a parent of /data1
+            temp_dep_mp="$dep_mp/"
+          else
+            temp_dep_mp="$dep_mp"
+          fi
+
+          if [ "${mp#$temp_dep_mp}" != "${mp}" ] && [ "$mp" != "$dep_mp" ]; then
+            add_dependency "$type:$mp" "$dep_type:$dep_mp"
+          fi
+        done < <($AWK '$1 ~ /^fs|btrfsmountedsubvol$/ { print; }' $DISKLAYOUT_FILE)
+        ;;
+      (swap)
+        dev=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        add_dependency "swap:$dev" "$dev"
+        add_component "swap:$dev" 'swap'
+        ;;
+      (drbd)
+        dev=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        disk=$(echo "$remainder" | $CUT -d ' ' -f '3')
+        add_dependency "$dev" "$disk"
+        add_component "$dev" 'drbd'
+        ;;
+      (crypt)
+        name=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        device=$(echo "$remainder" | $CUT -d ' ' -f '2')
+        add_dependency "$name" "$device"
+        add_component "$name" "crypt"
+        ;;
+      (multipath)
+        name=$(echo "$remainder" | $CUT -d ' ' -f '1')
+        disks=$(echo "$remainder" | $CUT -d ' ' -f '3' | $TR ',' ' ')
+        add_component "$name" 'multipath'
+        for disk in $disks ; do
+            add_dependency "$name" "$disk"
+        done
+        ;;
+    esac
+  done < $DISKLAYOUT_FILE
+}
+
+# Add a dependency from one component on another
+# add_dependency <from> <on>
+function add_dependency() {
+  echo "$1 $2" >> $DISKLAYOUT_DEPS
+}
+
+# Add a component to be restored
+# add_component <name> <type>
+# The name must be equal to the one used in dependency resolution
+# The type is needed to restore the component.
+function add_component() {
+  echo "todo $1 $2" >> $DISKLAYOUT_TODO
+}
+
+function install_file() {
+  #   $1: source path + filename
+  #   $2: target path
+  #   $3: mode for permissions (optional) default: source 
+  #               note: install defaults to 0755)
+
+  if [[ ! -f $1 ]]; then
+      Error "file not found: \`%s'" "$1"
+      return 1
+  fi
+
+  mode=${3:-$($STAT -c %a "$1")}
+  if [[ -z $mode ]]; then
+      Error "failed to stat file: \`%s'." "$1"
+      return 1
+  fi
+
+  if [[ -f $1 && -n $2 ]]; then
+    if [[ -f $2 ]]; then
+      target=$2
+    else
+      target="$2/${1##*/}"
+    fi
+    # compare "target path + source filename" with "source path + filename"
+    [[ $v == '--v' ]] && echo "$CMP --silent $target $1"
+    if ! $CMP --silent "$target" "$1" &>/dev/null; then
+      # echo "$2/${1##*/} <- $1"
+      $INSTALL $v --backup=simple -Dm$mode --preserve-timestamps "$1" "$2" >&2
+      return $?
+    fi
+  else
+    # source file not found or target empty
+    return 1
+  fi
+}
+
+# ------------- checks -----------------------------------------------------
+# don't run simultaneously / check if script is started 
+SCRIPT_PID=$(pgrep -f '/bin/bash .*/drp --.*')
+if ([[ -n "${SCRIPT_PID}" ]] && [[ "${SCRIPT_PID}" != "$$" ]]) || pgrep -x 'rsync'; then
+  echo 'Sorry, rsync is already running in the background. Exiting...'
+  echo "$($DATE +%Y-%m-%d_%H:%M:%S) ${HOST_LOCAL}: === Snapshot failed. ==="
+  exit 2
+fi
+
+# [[ -d $KMODULEDIR ]]
+# StopIfError "'$KMODULEDIR' is not a valid kernel module directory. Reboot after a system (f.e. pacman -Syu) kernel update."
+
+# Simple check for Arch Linux
+[[ -f '/etc/arch-release' ]]
+StopIfError "Error: Not running Arch Linux? '/etc/arch-release' is missing"
+
+[[ -e /proc/self/mountinfo ]]
+StopIfError "Error: /proc must be mounted"
+
+[[ -e /dev/fd ]]
+StopIfError "Error: /dev must be mounted"
+
+[[ -d /sys/devices ]]
+StopIfError "Error: /sys/devices must be mounted"
+
+# CPU architecture
+[[ `$UNAME -m` == 'x86_64' ]]
+StopIfError "Error: x86_64 (64-bit) CPU architecture not found"
+
+# Bash version check
+if ((BASH_VERSINFO[0] < 4)); then 
+  Error "Sorry, you need at least bash-4.x to run this script."  
+fi
+
+# make sure we're running as root
+#if (( `$ID -u` != 0 )); then { $ECHO "Error: need 'root' privileges (effective user ID is not 0)" >&2; exit 2; } fi
+[[ `$ID -u` == '0' ]]
+StopIfError "Error: need 'root' privileges (effective user ID is not 0)"
+
+# Kernel file check
+[[ -f "$KERNEL_FILE" ]]
+StopIfError "Error: Arch kernel '${KERNEL_FILE}' not found"
+
+# ipconfig file check
+[[ -f '/usr/lib/initcpio/ipconfig' ]]
+StopIfError "Error: ipconfig not found, install with: 'pacman -Sy mkinitcpio-nfs-utils'"
+
+[[ ! -e /sys/class/block/md*/md/level ]]
+StopIfError "Error: MD RAID and/or LVM not supported"
+
+# Check for required binaries
+declare -a missing_progs
+for prog in "${REQUIRED_PROGS[@]} ${INCLUDE_PROGS[@]}" ; do
+    has_binary "$prog" || missing_progs+=("$prog")
+done
+unset -v prog
+contains_visible_char "${missing_progs[*]}" && Error "Cannot find required programs: ${missing_progs[@]}"
+
+[[ -f "$UEFI_BOOTLOADER" ]]
+StopIfError "Error: expected boot loader not found: '${UEFI_BOOTLOADER}'"
+
+[[ -d "$SYSFS_DIR_EFI_VARS" ]]
+StopIfError "Error: '${SYSFS_DIR_EFI_VARS}' not found. UEFI booted?"
+
+
+# ------------- the prepare phase ------------------------------------------
+if [[ "$1" == '--prepare' ]]; then
+  readonly DEVICE="$2"
+  # Checks
+  [[ "$DEVICE" ]]
+  StopIfError "Device '$DEVICE' is not set."
+
+  [[ -b "$DEVICE" ]]
+  StopIfError "Device '$DEVICE' is not a block device"
+
+  readonly REAL_DEVICE=`readlink -f $DEVICE`
+  [[ "$REAL_DEVICE" ]] && [[ -b "$REAL_DEVICE" ]]
+  StopIfError "Unable to determine real device based on device '$DEVICE'."
+
+  #TODO: append space to $REAL_DEVICE
+  ! grep -qs "$REAL_DEVICE" /proc/mounts
+  StopIfError "Device '$REAL_DEVICE' should not be mounted."
+
+  #When device already has a btrfs file system on partition 2, ask for confirmation to force overwrite
+  if [[ -b "${REAL_DEVICE}2" ]]; then
+  	#When partition #2 fs-type = 'btrfs'
+  	format_answer=''
+  	file_output=`file -sbL "${REAL_DEVICE}2"`
+  	ID_FS_TYPE=$(
+    shopt -s nocasematch
+    case "$file_output" in
+        (*btrfs\ filesystem*)
+            $ECHO 'btrfs';;
+        (*)
+            $ECHO 'unknown';;
+    esac
+		)
+		unset -v file_output
+		if [[ "$ID_FS_TYPE" == 'btrfs' ]] && [[ -z "$YES" ]]; then
+  		#ask whether the user wants to format and erase all existing data
+  		LogPrint "USB device '${REAL_DEVICE}2' is formatted with btrfs filesystem"
+  		PS3="Type exactly 'Yes' to re-format ${REAL_DEVICE} and erase all existing data: "
+  		options=(Yes No)
+  		select opt in "${options[@]}"; do
+  			case "$opt,$REPLY" in
+  				(Yes,*|*,Yes) break ;;
+  				(No,*|*,No) break ;;
+  				(*) $ECHO 'invalid option' ;; 
+  			esac
+  		done
+			test "Yes" = "$REPLY" || PrintError "Abort format process by user (user input '$REPLY' is not 'Yes')"
+  		readonly force="-f"
+  		unset -v opt
+  	elif [[ "$YES" ]]; then
+  		readonly force="-f"
+  	fi
+  	unset -v ID_FS_TYPE
+  fi
+
+  #TODO: Check validity of UEFI partition size (1) 4k? fat-min? (2) resize to block size
+
+
+
+	# Stage: Output - write target
+	# ===========================================================================================
+	
+  # Zap iso9660 label area, otherwise there might be leftovers from previous installations
+	$DD if=/dev/zero of=${REAL_DEVICE} bs=512 count=12 seek=64 conv=notrunc status=noxfer >/dev/null
+
+  LogPrint "Creating GUID partition table (GPT) on '$REAL_DEVICE'"
+  $PARTED -s $REAL_DEVICE mklabel gpt >&2
+  StopIfError "Failed to create GPT partition table on '$REAL_DEVICE'"
+
+  LogPrint "Creating EFI system partition (ESP) with size $UEFI_PART_SIZE MiB aligned at $PARTITION_ALIGN_BLOCK_SIZE MiB on '$REAL_DEVICE'"
+  $PARTED -s $REAL_DEVICE mkpart ESP fat$FAT ${PARTITION_ALIGN_BLOCK_SIZE}MiB $(( $PARTITION_ALIGN_BLOCK_SIZE + $UEFI_PART_SIZE ))MiB >&2
+  StopIfError "Failed to create EFI system partition on '$REAL_DEVICE'"
+
+  $PARTED -s $REAL_DEVICE name 1 "$EFI_LABEL" >&2
+  StopIfError "Failed to label EFI system partition '$REAL_DEVICE1' as '$EFI_LABEL'"
+
+  $PARTED -s $REAL_DEVICE set 1 esp on >&2
+  StopIfError "Failed to mark EFI system partition '$REAL_DEVICE1' as 'esp/bootable'"
+
+  LogPrint "Creating recovery data partition up to 100% of '$REAL_DEVICE'"
+  # fs-type 'btrfs' is a pointer to generic partition code 0x83, often displayed as ext2
+  $PARTED -s $REAL_DEVICE mkpart primary btrfs $(( $PARTITION_ALIGN_BLOCK_SIZE + $UEFI_PART_SIZE ))MiB 100% >&2
+  StopIfError "Failed to create recovery data partition on '$REAL_DEVICE'"
+
+  $PARTED -s $REAL_DEVICE name 2 "$DESTINATION_DEVICE_FILESYSTEM_LABEL" >&2
+  StopIfError "Failed to label recovery data partition on '$REAL_DEVICE' as '$DESTINATION_DEVICE_FILESYSTEM_LABEL'"
+
+  #$PARTPROBE $REAL_DEVICE
+  #$SLEEP 5 # Give udev time to process the above changes
+
+  LogPrint "Creating vfat filesystem on EFI system partition on '${REAL_DEVICE}1'"
+  $MKFS_VFAT -F $FAT -n "$EFI_LABEL" ${REAL_DEVICE}1 >/dev/null
+  StopIfError "Failed to create vfat filesystem on '${REAL_DEVICE}1'"
+
+  # create link for EFI partition in /dev/disk/by-label
+	#$PARTPROBE $REAL_DEVICE
+	#$SLEEP 5 # Give udev time to process the above changes
+	if [[ "$REPLY" != "No" ]]; then
+		LogPrint "Creating btrfs filesystem with label '$DESTINATION_DEVICE_FILESYSTEM_LABEL' on '${REAL_DEVICE}2'"
+		$MKFS_BTRFS -L "$DESTINATION_DEVICE_FILESYSTEM_LABEL" $force ${REAL_DEVICE}2 >&2
+		StopIfError "Failed to create btrfs filesystem on '${REAL_DEVICE}2'"
+	fi
+
+	# Fail if EFI partition /dev/disk/by-label/$EFI_LABEL is not present
+	if [[ ! -b ${EFI_PART} ]]; then
+		$PARTPROBE $REAL_DEVICE
+		$SLEEP 1 # Give system time to process the above changes
+		if [[ ! -b ${EFI_PART} ]]; then
+			$SLEEP 4 # Give system more time to process the above changes
+	    if [[ ! -b ${EFI_PART} ]]; then
+	    	Error "${EFI_PART} is not available"
+	    fi
+	  fi
+	fi
+fi
+
+#                                                           prev: Error
+readonly BUILD_DIR="$($MKTEMP -d -t drp.XXXXXXXXXXXXXXX)"
+StopIfError "Could not create build area '$BUILD_DIR'"
+
+# Cleanup handler
+  trap '
+  $RM -r $BUILD_DIR >/dev/null 2>&1
+  ' INT QUIT TERM EXIT
+
+readonly TMP_DIR=$BUILD_DIR/tmp
+$MKDIR -p $v $TMP_DIR >&2 || StopIfError "Could not create $TMP_DIR"
+
+# TODO: compare CHECK_CONFIG_FILES[@] 600_snapshot_files.sh
+
+
+
+# ------------- the make bootable phase ------------------------------------------
+if [[ "$1" == '--mkboot' || "$1" == '--prepare' || "$1" == '--mkbackup' ]]; then
+  #echo "Make bootable______($KMODULEDIR)"
+  #umask 0077
+  if [[ ! -b ${EFI_PART} ]]; then
+    Error "${EFI_PART} is not available"
+  fi
+
+  # Temporary folder
+  readonly EFI_MPT=$($MKTEMP -d /tmp/drp-efi.XXXXX)
+  StopIfError "Failed to create mount point ${EFI_MPT}"
+
+  # Mount EFI partition
+  # alt: mount $( blkid -L $EFI_PART )
+  #                  /tmp/drp-efi.xxxxx
+  $MOUNT ${EFI_PART} ${EFI_MPT}
+  StopIfError "Failed to mount EFI partition ${EFI_PART} to ${EFI_MPT}"
+
+	# ___Intel microcode___
+  install_file '/boot/intel-ucode.img' "$EFI_MPT"
+  #'/boot/intel-ucode.img' -> '/mnt/sdX1/intel-ucode.img'
+  StopIfError "Failed to install Intel microcode to $EFI_MPT"
+
+  # ___Kernel___
+  # after kernel updates but before reboot the running kernel module dirs are gone -> can't make initramfs
+  if [[ -d $KMODULEDIR ]]; then
+    # generating initramfs costs quite some time, only run explicit or try detect (kernel) changes
+    declare -i mkinitramfs
+    if [[ "$1" == '--mkbackup' ]]; then
+      #echo "$CMP --silent $KERNEL_FILE ${EFI_MPT}/`$BASENAME $KERNEL_FILE`"
+      if $CMP --silent "$KERNEL_FILE" "${EFI_MPT}/`$BASENAME $KERNEL_FILE`" &>/dev/null; then
+        mkinitramfs=0
+      else
+        mkinitramfs=1
+      fi
+    else
+      mkinitramfs=1
+    fi
+    #echo "mkinitramfs=$mkinitramfs"
+  
+    # ___Initramfs___
+    # after kernel updates but before reboot the running kernel module dirs are gone -> can't make initramfs
+    if [[ $mkinitramfs == 1 ]]; then
+      echo 'Make (temp) initramfs'
+    	# Linux kernel
+    	install_file "$KERNEL_FILE" "$EFI_MPT"
+    	#'/boot/vmlinuz-linux' -> '/mnt/sdX1/vmlinuz-linux'
+    	StopIfError "Could not copy $KERNEL_FILE to $EFI_MPT"
+      
+
+    	# Make custom initramfs
+    	# ---------------------
+
+      # set temporary marker
+      readonly marker="$TMP_DIR"/marker
+      $TOUCH "$marker"
+
+    	# create temporary locations, like INITial Ram Drive root File System
+      readonly ROOTFS_DIR=$BUILD_DIR/rootfs
+      $MKDIR -p $v $ROOTFS_DIR >&2 || StopIfError "Could not create $ROOTFS_DIR"
+      echo "$ROOTFS_DIR"
+
+    	# base directory structure from https://git.archlinux.org/mkinitcpio.git/tree/functions#n673
+    	$INSTALL $v -dm755 "$ROOTFS_DIR"/{proc,sys,dev,run,tmp,etc,usr/{local,lib,bin}}
+    	$LN -s 'usr/lib' "$ROOTFS_DIR/lib"
+    	$LN -s '../lib'  "$ROOTFS_DIR/usr/local/lib"
+    	$LN -s 'bin'     "$ROOTFS_DIR/usr/sbin"
+    	$LN -s 'usr/bin' "$ROOTFS_DIR/bin"
+    	$LN -s 'usr/bin' "$ROOTFS_DIR/sbin"
+    	$LN -s '../bin'  "$ROOTFS_DIR/usr/local/bin"
+    	$LN -s '../bin'  "$ROOTFS_DIR/usr/local/sbin"
+    	$LN -s 'lib'     "$ROOTFS_DIR/usr/lib64"
+    	$LN -s 'usr/lib' "$ROOTFS_DIR/lib64"
+      # mount tables
+    	$LN -s '/proc/self/mounts' "$ROOTFS_DIR/etc/mtab"
+      : > "$ROOTFS_DIR/etc/fstab"
+      # indicate that this is an initramfs
+      : > "$ROOTFS_DIR/etc/initrd-release"
+      # add a blank ld.so.conf to keep ldconfig happy
+      : > "$ROOTFS_DIR/etc/ld.so.conf"
+      # kernel module dir
+      $INSTALL $v -m755 -d "$ROOTFS_DIR/usr/lib/modules/$KERNELVERSION/kernel"
+      # update all modification times to the time of the current kernel file 
+      # this to create binary identical initramfs files at consecutive runs
+      #  touch --no-dereference (-h) --no-create (-c)
+      $FIND "$ROOTFS_DIR/.." "$ROOTFS_DIR/" \( ! -name .. -o -prune \) -exec $TOUCH -chr "$KERNEL_FILE" {} +
+
+      # add progs
+      add_binary $BUSYBOX '/bin/busybox'
+      # [, ash, awk, basename, blkdiscard, cat, chgrp, chmod, chown, chroot, clear, cp, cttyhack, cut, dd, df, dirname, dmesg, du, echo, env,
+      # expr, fallocate, false, fatattr, free, fsfreeze, fstrim, getopt, grep, halt, head, hexdump, ifconfig, init, install, ip, ipaddr,
+      # iplink, ipneigh, iproute, iprule, iptunnel, kbd_mode, kill, killall, less, link, ln, loadfont, loadkmap, losetup, ls, lsscsi, md5sum,
+      # mkdir, mkfifo, mknod, mkpasswd, mktemp, mountpoint, mv, nc, netstat, nproc, nsenter, nslookup, openvt, partprobe, paste, pgrep,
+      # pidof, ping, ping6, poweroff, printf, ps, pwd, readlink, reboot, rm, rmdir, route, sed, seq, setfont, sh, sha1sum, sha256sum,
+      # sha512sum, shuf, sleep, sort, stat, strings, sync, tac, tail, telnet, test, tftp, touch, true, truncate, umount, uname, uniq, unlink,
+      # unshare, uptime, vi, wc, wget, xxd, yes
+      for applet in $($BUSYBOX --list); do
+        add_symlink "/usr/bin/$applet" 'busybox'
+      done
+
+      add_binary 'mount'
+
+      add_binary 'setsid' # allows starting /init rescue shell at tty
+
+      # kmod with applet symlinks
+      add_binary 'kmod'
+      for applet in {dep,ins,rm,ls}mod mod{probe,info}; do
+        add_symlink "/usr/sbin/$applet" 'kmod'
+      done
+      unset -v applet
+
+      # copy modprobe config (among other things for blacklisting modules)
+      add_full_dir /etc/modprobe.d '*.conf'
+
+      # module autodetection
+      declare -a mods
+      # hardware
+      mapfile -t mods < <(auto_modules)
+      # exclude modules explicitly // filesystems cannot be excluded
+      for m in "${EXCLUDE_MODULES[@]}"; do
+      	mods=( ${mods[@]##$m} )
+      done
+      for m in "${mods[@]}"; do	
+        _autodetect_cache["$m"]=1
+      done
+      unset -v m mods
+      
+      # file systems, including btrfs and vfat
+    	declare -a mountedfs
+    	mapfile -t mountedfs < <($AWK '{print $3}END{printf 'btrfs\nvfat'}' /proc/mounts | $SORT -u 2>/dev/null)
+    	for fs in "${mountedfs[@]}"; do
+    		# exclude pseudofs
+    		if [[ ${pseudofs_types["$fs"]} != '1' ]]; then
+    			add_if_avail "$fs"
+    		fi
+    	done
+    	unset -v mountedfs fs
+
+      # prime kernel builtin modules (no need adding modules that are already in the kernel)
+      if [[ -r $KMODULEDIR/modules.builtin ]]; then
+        while IFS=/ read -a path; do
+            modname=${path[-1]%.ko}
+            _addedmodules["${modname//-/_}"]=2
+        done <"$KMODULEDIR/modules.builtin"
+        unset -v modname path
+    	fi
+
+    	# add progs
+      map add_binary "${PROGS[@]}"
+      map add_binary "${INCLUDE_PROGS[@]}"
+
+      # add modules
+      map add_module "${INCLUDE_MODULES[@]}"
+      add_autodetected_modules '/fs'
+      # keyboard
+      map add_module {e,x}hci_{hcd,pci} #USB2=e, USB3=x
+      add_autodetected_modules '/hid/hid'
+    	add_module 'usbhid'
+    	add_autodetected_modules '/input/(serio|keyboard)'
+      # networking
+      add_autodetected_modules '/drivers/net/'
+      add_binary 'blkid'
+      #add_binary '/usr/bin/ip' '/sbin/ip' #overwrites busybox ip
+    	add_binary '/usr/lib/initcpio/ipconfig' '/sbin/ipconfig'
+    	#add_file '/etc/resolv.conf'
+
+    	# add dropbear when it exists
+    	if [[ -f '/usr/bin/dropbear' && -f '/usr/bin/dropbearconvert' && -f '/usr/bin/dropbearkey' ]]; then
+    		add_binary 'dropbear'
+    		add_file '/lib/libnss_files.so.2' #for authentication
+    		copy_openssh_keys || generate_dropbear_keys
+    		add_dir '/root/.ssh' '600'
+    		add_file '/root/.ssh/authorized_keys' '' '600'
+    		add_full_dir '/etc/dropbear'
+    		add_dir '/var/run'
+    		add_dir '/var/log'
+    		: > "$ROOTFS_DIR/var/log/lastlog"
+
+    		#create root user
+    		echo "root::0:0::/root:/bin/sh" > "$ROOTFS_DIR/etc/passwd"
+    	fi
+    	
+    	# add modules to /config
+    	for mod in "${!_addedmodules[@]}"; do
+    		mod=${mod//-/_}
+    		# only add real modules (2 == builtin)
+    		if (( _addedmodules["$mod"] == 1 )); then
+    			add+=("$mod")
+    		fi
+    	done
+    	{
+    		(( ${#add[*]} )) && printf 'MODULES="%s"\n' "${add[*]}"
+    	} > "$ROOTFS_DIR/config"
+    	unset -v add
+
+    	install_modules "${!_modpaths[@]}"
+
+    	# why is this nice to have?
+    	if [[ -x /usr/bin/ldconfig ]]; then
+        ldconfig -r "$ROOTFS_DIR" &>/dev/null # create /etc/ld.so.cache
+      fi
+
+    	# trim/reduce executable size
+    	#                                 owner write bit set
+      $FIND "$ROOTFS_DIR" -type f -perm -u+w -print0 2>/dev/null | while read -d '' bin; do
+        case $(file -bi "$bin") in
+          (*application/x-sharedlib*)
+            # Libraries (.so)
+            strip --strip-unneeded --preserve-dates $v "$bin"
+            ;;
+          (*application/x-archive*)
+            # Libraries (.a)
+            strip --strip-debug --preserve-dates $v "$bin"
+            ;;
+          (*application/x-executable*)
+            # Binaries
+            strip --strip-all --preserve-dates $v "$bin"
+            ;;
+        esac
+      done
+      unset -v bin
+
+      # TODO: inline . /config
+      # TODO: replace mkinitcpio-nfs-utils with busybox ip/ipaddr configuration
+
+      # no tab stripping
+      $CAT <<'EOF' > "$TMP_DIR/init"
+#!/usr/bin/ash
+#echo 'Hello world'
+
+#mount setup
+mount -t proc proc /proc -o nosuid,noexec,nodev
+mount -t sysfs sys /sys -o nosuid,noexec,nodev
+mount -t devtmpfs dev /dev -o mode=0755,nosuid
+mount -t tmpfs run /run -o nosuid,nodev,mode=0755
+mkdir -m755 /run/initramfs
+[ -e /sys/firmware/efi ] && mount -t efivarfs efivarfs /sys/firmware/efi/efivars -o nosuid,nodev,noexec
+
+# parse the kernel command line
+startswith() {
+    local word=$1 prefix=$2
+
+    case $word in
+        $prefix*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+endswith() {
+    local word=$1 suffix=$2
+
+    case $word in
+        *$suffix)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+parse_cmdline_item() {
+    local key=$1 value=$2
+
+    case $key in
+        rw|ro)
+            ;;
+        fstype)
+            ;;
+        initrd)
+            ;;
+        fbcon)
+            ;;
+        fsck.mode)
+            ;;
+        rd.debug)
+            ;;
+        rd.log)
+            ;;
+        [![:alpha:]_]*|[[:alpha:]_]*[![:alnum:]_]*)
+            # invalid shell variable, ignore it
+            echo "invalid shell variable, ignoring: $key=$value"
+            ;;
+        *)
+            # valid shell variable
+            #echo "eval $key='${value:-y}'"
+            eval "$key"='${value:-y}'
+            ;;
+    esac
+}
+
+process_cmdline_param() {
+    local item_callback=$1 key=$2 value=$3
+
+    # maybe unquote the value
+    if startswith "$value" "[\"']" && endswith "$value" "${value:0:1}"; then
+        value=${value#?} value=${value%?}
+    fi
+
+    "$item_callback" "$key" "$value"
+}
+
+parse_cmdline() {
+    local item_callback=${1:-parse_cmdline_item}
+    local cmdline word quoted key value
+
+    set -f
+    read -r cmdline
+    set -- $cmdline
+    set +f
+
+    for word; do
+        if [ -n "$quoted" ]; then
+            value="$value $word"
+        else
+            case $word in
+                *=*)
+                    key=${word%%=*}
+                    value=${word#*=}
+
+                    if startswith "$value" "[\"']"; then
+                        quoted=${value:0:1}
+                    fi
+                    ;;
+                '#'*)
+                    break
+                    ;;
+                *)
+                    key=$word
+                    ;;
+            esac
+        fi
+
+        if [ -n "$quoted" ]; then
+            if endswith "$value" "$quoted"; then
+                unset quoted
+            else
+                continue
+            fi
+        fi
+
+        process_cmdline_param "$item_callback" "$key" "$value"
+        unset key value
+    done
+
+    if [ -n "$key" ]; then
+        process_cmdline_param "$item_callback" "$key" "$value"
+    fi
+}
+parse_cmdline </proc/cmdline
+
+#-----------------
+# install modules
+#-----------------
+[ -f /config ] && . /config
+if [ -n "$earlymodules$MODULES" ]; then
+    modprobe -qab ${earlymodules//,/ } $MODULES #quiet
+    #modprobe -vab ${earlymodules//,/ } $MODULES #verbose
+fi
+
+configure_eth_device ()
+{
+    local line i address netmask gateway dns0 dns1 rootserver rootpath defaultrootpath defaultserver
+
+    : > /ip_opts
+
+    if [ -n "${ip_dev}" ]; then
+
+        # validate input
+        # trim 7th colon and after because mkinitcpio-nfs-utils ancient ipconfig only accepts up to 7 elements
+        # https://unix.stackexchange.com/questions/412952/is-there-a-parameter-substitution-expansion-alternative-for-cut-f1-2-3-d
+        # ip_dev=$(cut -f1-7 -d: <<< "${ip_dev}")
+        ip_dev=${ip_dev%:${ip_dev#*:*:*:*:*:*:*:}}
+        
+        if [ -n "$netconf_timeout" ]; then
+            ipconfig_cmd="ipconfig -t $netconf_timeout ip=${ip_dev}"
+        else
+            ipconfig_cmd="ipconfig ip=${ip_dev}"
+        fi
+
+        # setup network and save some values
+        $ipconfig_cmd | while read line; do
+            if [ "${line#"IP-Config:"}" != "${line}" ]; then
+                continue
+            fi
+
+            line="$(echo ${line} | sed -e 's/ :/:/g;s/: /=/g')"
+
+            for i in ${line}; do
+                case "${i}" in
+                    (address=*)
+                        echo "${i}" >> /ip_opts
+                        ;;
+                    (netmask=*)
+                        echo "${i}" >> /ip_opts
+                        ;;
+                    (gateway=*)
+                        echo "${i}" >> /ip_opts
+                        ;;
+                    (dns0=*)
+                        echo "${i}" >> /ip_opts
+                        ;;
+                    (dns1=*)
+                        echo "${i}" >> /ip_opts
+                        ;;
+                    (rootserver=*)
+                        echo "${i}" >> /ip_opts
+                        ;;
+                    (rootpath=*)
+                        echo "${i}" >> /ip_opts
+                        ;;
+                esac
+            done
+        done
+
+        echo "device=$(echo ${ip_dev} | cut -d: -f6)" >> /ip_opts
+        echo "$(echo ${ip_dev} | cut -d: -f6)" >> /ip_devices
+
+        . /ip_opts
+        echo "IP-Config: ${device}: ${address}/${netmask}"
+        echo "IP-Config: ${device}: gw: ${gateway}    dns0: ${dns0}    dns1: ${dns1}"
+
+        return 0
+    fi
+}
+
+#----------------------
+# configure eth device
+#----------------------
+: > /ip_devices
+
+# if ip is empty use nfsaddrs
+#echo "ip=${ip}"
+if [ -z "${ip}" -a -n "${nfsaddrs}" ]; then
+  ip="${nfsaddrs}"
+elif [ -z "${ip}" ]; then
+  #if nothing configured, fall back to dhcp
+  ip='ip=dhcp'
+fi
+
+if [ -n "${ip}" ]; then
+  case ${ip} in
+    ip=*)
+      # trim prefix 'ip='
+      for ip_dev in $(echo ${ip} | sed -e 's/ip=/\n/g' | sed -e 's/:$//g' | sed '/^$/d'); do
+        configure_eth_device
+      done
+      ;;
+    *)
+      ip_dev="${ip}"
+      configure_eth_device
+      ;;
+  esac
+fi
+
+#----------------------
+# start dropbear
+#----------------------
+[ -d /dev/pts ] || mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+
+echo 'Starting dropbear SSH server on port 22'
+#                  -E           log to standard error
+#                     -s        disable password logins
+#                        -j     disable local port forwarding
+#                           -k  disable remote port forwarding
+/usr/sbin/dropbear -E -s -j -k >/dev/null
+sleep 1 #wait for Running in background log message to appear
+
+#----------------
+# launch console
+#----------------
+export PS1='[rootfs \W]\$ '
+export HOME='/root'
+cd /root
+
+# explicitly redirect to /dev/console in case we're logging. note that
+# anything done in the rescue shell will NOT be logged.
+#{ sh -i } 0</dev/console 1>/dev/console 2>/dev/console
+exec setsid sh -c 'exec sh -l </dev/tty1 >/dev/tty1 2>&1'
+
+run_cleanuphook ()
+{
+  #dropbear
+  umount /dev/pts
+  rm -R /dev/pts
+  if [ -f /var/run/dropbear.pid ]; then
+    kill `cat /var/run/dropbear.pid`
+  fi
+
+  #ethernet
+  for device in $(cat /ip_devices); do
+    /sbin/ip addr flush dev "$device"
+    /sbin/ip link set down "$device"
+  done
+}
+EOF
+      $INSTALL -m755 $v "$TMP_DIR/init" "$ROOTFS_DIR/init"
+      [[ -f /etc/hostname ]] && $INSTALL $v /etc/hostname "$ROOTFS_DIR/etc/hostname"
+
+      # Load vars with replacement
+      $CAT <<EOF > "$TMP_DIR/recover-config"
+readonly HOST_LOCAL="$HOST_LOCAL" # HOSTNAME
+readonly DESTINATION_DEVICE_FILESYSTEM_LABEL="$DESTINATION_DEVICE_FILESYSTEM_LABEL"
+readonly DATA_PART="$DATA_PART"
+readonly RSYNC_OPTIONS="$RSYNC_OPTIONS"
+EOF
+      # Create literal
+      #$CAT <<'EOF' > "$TMP_DIR/recover"
+#EOF
+      #$INSTALL -m755 $v "$TMP_DIR/recover" "$ROOTFS_DIR/root/recover"
+      $INSTALL -m755 $v "/root/drp/recover" "$ROOTFS_DIR/root/recover" #debug
+      $INSTALL -m644 $v "$TMP_DIR/recover-config" "$ROOTFS_DIR/root/recover-config"
+      #debug in dev.env.
+      #$INSTALL -m755 $v --backup=numbered "$TMP_DIR/recover" "/root/drp/recover"
+      $INSTALL -m644 $v --backup=numbered "$TMP_DIR/recover-config" "/root/drp/recover-config"
+
+      # loading .ash_history/HISTFILE impossible with mkinitcpio-busybox 1.27.2-1 due to "CONFIG_FEATURE_EDITING_SAVEHISTORY is not set"
+      # https://git.archlinux.org/svntogit/packages.git/tree/trunk/config?h=packages/mkinitcpio-busybox#n97
+      $CAT <<-EOF > "$ROOTFS_DIR/root/.ash_history"
+: # no more predefined entries in the ash history
+reboot -f
+lsblk
+mount -o remount,ro PARTLABEL=$DESTINATION_DEVICE_FILESYSTEM_LABEL /mnt/data
+nano /mnt/data/var/lib/drp/layout/disklayout.conf
+mount -o remount,rw PARTLABEL=$DESTINATION_DEVICE_FILESYSTEM_LABEL /mnt/data
+mkdir /mnt/data;mount -o ro PARTLABEL=$DESTINATION_DEVICE_FILESYSTEM_LABEL /mnt/data
+: # there are some predefined entries in the bash history
+EOF
+
+      $CAT <<-EOF > "$ROOTFS_DIR/etc/profile"
+alias reboot='reboot -f'
+alias dir='ls -Alp'
+alias cls='clear'
+#HISTFILE=/root/.ash_history
+PATH=/usr/bin:/bin:/root
+echo "Welcome to DRP. Run \"recover\" to restore your system!"
+EOF
+
+      # FIXME: try to create identical initramfs (bsdcpio) bytestream
+      # requires: identical metadata on consecutive runs
+      # fails due to changing inode number -> different byte streams every run
+      # <https://unix.stackexchange.com/questions/410324/is-it-possible-to-re-create-a-directory-structure-that-creates-a-binary-identica/>
+
+      # Alternative initramfs check: unpack and diff compare files/folders within
+      overwrite=1
+      # does target initramfs already exist?
+      if [[ -e "$EFI_MPT/$INITRAMFS_FILE" ]]; then
+        # diff compare extracted file contents before updating
+        readonly EXTRAC_DIR=$($MKTEMP -d /tmp/drp-extr.XXXXX)
+        #   extract to temp location
+        pushd "$EXTRAC_DIR" >/dev/null
+        lsinitcpio -x "$EFI_MPT/$INITRAMFS_FILE"
+        popd >/dev/null
+        #   compare
+        # echo "diff -qr $ROOTFS_DIR $EXTRAC_DIR"
+        diff -qr "$ROOTFS_DIR" "$EXTRAC_DIR" >/dev/null
+        # no differences, then
+        [[ $? == 0 ]] && overwrite=0 # Don't create new initramfs 
+        rm -r "$EXTRAC_DIR"
+      fi
+
+      if [[ $overwrite == 1 ]]; then
+        # build image for speed
+      	pushd "$ROOTFS_DIR" >/dev/null
+      	$FIND -mindepth 1 -printf '%P\0' |
+           LANG=C $BSDCPIO -0 -a -m -o -H newc |
+           $LZ4 -l > "$BUILD_DIR/$INITRAMFS_FILE"
+        pipesave=("${PIPESTATUS[@]}") # save immediately
+      	popd >/dev/null
+
+      	if (( pipesave[0] )); then
+            errmsg="find reported an error"
+        elif (( pipesave[1] )); then
+            errmsg="bsdcpio reported an error"
+        elif (( pipesave[2] )); then
+            errmsg="lz4 reported an error"
+        fi
+
+        if [[ $errmsg ]]; then
+          Error "Image generation FAILED: %s" "$errmsg"
+        elif (( _builderrors == 0 )); then
+          install_file "$BUILD_DIR/$INITRAMFS_FILE" "$EFI_MPT"
+          Print "Image generation successful"
+        fi
+
+        unset -v pipesave errmsg
+      fi
+
+      # TODO: build 2nd image with different compression
+
+
+
+
+      # Systemd-boot (former known as Gummiboot) boot manager 
+    	# -----------------------------------------------------
+
+    	# 1/3 install
+    	# manual file compare because bootctl update copies files always 
+    	#                                --no-variables = don't touch EFI variables
+    	if [[ ! -f $EFI_MPT/EFI/systemd/$UEFI_BOOTLOADER_BASENAME || ! -f $EFI_MPT/EFI/BOOT/BOOTX64.EFI ]] || \
+        ! $CMP -s $UEFI_BOOTLOADER $EFI_MPT/EFI/systemd/$UEFI_BOOTLOADER_BASENAME 2>/dev/null || \
+        ! $CMP -s $UEFI_BOOTLOADER $EFI_MPT/EFI/BOOT/BOOTX64.EFI 2>/dev/null ; then
+          [[ -f $EFI_MPT/EFI/systemd/$UEFI_BOOTLOADER_BASENAME ]] && $MV $v -f $EFI_MPT/EFI/systemd/$UEFI_BOOTLOADER_BASENAME{,~}
+          [[ -f $EFI_MPT/EFI/BOOT/BOOTX64.EFI ]] && $MV $v -f $EFI_MPT/EFI/BOOT/BOOTX64.EFI{,~}
+          $BOOTCTL --path=$EFI_MPT --no-variables install
+          # Created "/mnt/sdX1/EFI".
+          # Created "/mnt/sdX1/EFI/systemd".
+          # Created "/mnt/sdX1/EFI/BOOT".
+          # Created "/mnt/sdX1/loader".
+          # Created "/mnt/sdX1/loader/entries".
+          # Copied "/usr/lib/systemd/boot/efi/systemd-bootx64.efi" to "/mnt/sdX1/EFI/systemd/systemd-bootx64.efi".
+          # Copied "/usr/lib/systemd/boot/efi/systemd-bootx64.efi" to "/mnt/sdX1/EFI/BOOT/BOOTX64.EFI".
+    		  StopIfError "Failed to install systemd-boot to ${EFI_MPT}"
+      fi
+
+    	# 2/3 configuration
+
+    	# item .conf for menu entry
+
+    	# parse /etc/dhcpcd.conf for static IP config
+      # FIXME: only 1st eth interface is handled, cases with multi NIC's will choose 1st private IP value in config
+      declare -i interface_def=0
+      declare ip_address router flag_static
+
+      while read -r line; do
+
+        if ((interface_def==0)) && [[ $line = interface\ * ]]; then
+          let interface_def=1
+        elif [[ $line = interface\ * ]]; then # reset on new interface definition
+          flag_static=''
+          ip_address=''
+          router=''
+        fi
+
+        if ((interface_def)); then
+          if [[ $line = static\ ip_address=* ]]; then # static ip_address=192.168.7.2/24
+            line=${line#static ip_address=}
+            ip_address=${line%/*} # trim right-side /*
+            flag_static='static'
+          elif [[ $line = static\ routers=* ]]; then  # static routers=192.168.7.1
+            line=${line#static routers=}
+            router=${line%,*} # trim right-side ,*
+          fi
+
+          if [[ -n ${ip_address} && -n ${router} ]]; then
+            case ${ip_address} in
+              # quit reading on first private address, like 172.[16-31].x.x|10.x.x.x|192.168.x.x
+              (192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) break ;;
+            esac
+          fi
+        fi
+      done < "/etc/dhcpcd.conf"
+
+    	[[ -f '/boot/intel-ucode.img' ]] && initrd_intel_ucode_img='initrd /intel-ucode.img' || initrd_intel_ucode_img=
+
+    	# with tab stripping and variable expansion
+      # FIXME: remove ip=... param when ${flag_static} is not set?
+      $CAT <<-EOF > "$BUILD_DIR/recover.conf"
+		# fbcon=scrollback:128k to <shift><PgUp> to early boot messages at console
+		# init defaults to /sbin/init
+		# memtest=1 runs the memory test 1 time (0 to disable)
+		# quiet loglevel=3, to suppress message output, to see more messages increase up till 7.
+		# vga=normal means 80x25 text mode
+
+		title Recover this system
+		linux /vmlinuz-linux
+		$initrd_intel_ucode_img
+		initrd /$INITRAMFS_FILE
+		options fbcon=scrollback:128k memtest=0 quiet loglevel=3 vga=normal ip=${ip_address}::${router}::$HOST_LOCAL::${flag_static}
+EOF
+      # ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf> [ 7 elements ]
+    	StopIfError "Failed to create <tmp>/recover.conf"
+    	install_file "$BUILD_DIR/recover.conf" "$EFI_MPT/loader/entries/"
+    	StopIfError "Failed to create <esp>/loader/entries/recover.conf"
+
+    	# TODO: 2nd item for backup (copy) entry for duplicate copy of (1) kernel, (2) intel-ucode and (3) initrd files; 
+    	# optimal in different bit-stream to prevent flash controller dedup
+
+    	# 3/3 menu config
+      # with tab stripping
+    	$CAT <<-'EOF' > "$BUILD_DIR/loader.conf"
+default recover
+timeout 0
+EOF
+      StopIfError "Failed to create <tmp>/loader.conf"
+      install_file "$BUILD_DIR/loader.conf" "$EFI_MPT/loader/loader.conf"
+  		StopIfError "Failed to create <esp>/loader/loader.conf"
+    fi #end make initramfs 
+  fi #end kernel
+
+	#TODO: install Rescue Boot Manager menu entry 
+  # and make that entry not become default (EFI stub)
+	#efibootmgr -c -d ${REAL_DEVICE} -p Y -l /EFI/systemd/systemd-bootx64.efi -L "Rescue"
+
+
+	# Stage 7/7: Cleanup
+	# ===========================================================================================
+	# clean EFI temporary mount point
+	# + Error 'Could not remove temporary directory /tmp/drp-efi.6AQO6, please check manually'
+	$UMOUNT ${EFI_MPT}
+	if [[ $? -eq 0 ]]; then
+	  $RMDIR ${EFI_MPT}
+	  StopIfError "Could not remove temporary directory ${EFI_MPT}, please check manually"
+	else
+	  Error "Could not umount ${EFI_MPT}, please check manually"
+	fi
+
+	#TODO: exit or continue with making the first backup?
+	#exit 1
+fi
+
+
+# ------------- the backup phase -------------------------------------------
+# "$1" == '--mkboot' || 
+if [[ "$1" == '--mkbackup' || "$1" == '--prepare' ]]; then
+  #v='-v' # temp debug
+  # Stage 1/2: Layout
+  # ===========================================================================================
+
+	# Temporary folder
+	readonly DATA_MPT=$($MKTEMP -d /tmp/drp-data.XXXXX)
+  #                  zstd since kernel 4.14
+	$MOUNT -o compress=zstd $DATA_PART $DATA_MPT
+
+
+
+  # Cleanup handler
+  trap '
+  $UMOUNT $DATA_MPT >/dev/null 2>&1
+  $RM -r $DATA_MPT >/dev/null 2>&1
+  [[ -n $strDate && -d "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" ]] && \
+    btrfs subvolume delete "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" >/dev/null 2>&1
+  [[ -n $LATEST ]] && rm -f "$SNAPSHOT_DST/$HOST_SRC/$LATEST.Temporary"
+  ' INT QUIT TERM EXIT
+
+  # attempt to remount the RW mount point as RW; else abort
+	#$MOUNT -o remount,rw $MOUNT_DEVICE $SNAPSHOT_RW
+	#if (( $? )); then
+	#	$ECHO "snapshot: could not remount $SNAPSHOT_RW readwrite" >&2
+	#	exit 2
+	#fi
+
+	# TODO: protective MBR
+
+	# layout (100_create_layout_file.sh)
+
+  # check and make temporary and final folder structure
+  for directory in $TMP_DIR $VAR_DIR; do
+    for subdir in layout recovery layout/config; do
+      [[ -d $directory/$subdir ]] || $MKDIR -p $directory/$subdir >&2
+    done
+  done
+  unset -v directory subdir
+
+	# store in $TMP_DIR
+  readonly DISKLAYOUT_FILE="$TMP_DIR/layout/disklayout.conf"
+  readonly DISKLAYOUT_DEPS="$TMP_DIR/layout/diskdeps.conf"
+  readonly DISKLAYOUT_TODO="$TMP_DIR/layout/disktodo.conf"
+
+  # create 0-byte files
+  : > $DISKLAYOUT_FILE
+  : > $DISKLAYOUT_DEPS
+  : > $DISKLAYOUT_TODO
+
+  # Remember the mappings if any for disk-by-id (150_save_diskbyid_mappings.sh)
+  ls /dev/disk/by-id | while read BY_ID;
+  do
+    ID_NEW=$($UDEVADM info --query=name --name /dev/disk/by-id/$BY_ID)
+    $ECHO $BY_ID $ID_NEW
+  done >$TMP_DIR/recovery/diskbyid_mappings
+  unset -v BY_ID ID_NEW
+
+  # Exclude backup target device
+  backupdev=$($READLINK -f "$DATA_PART") # /dev/sdb2
+  backupdev=${backupdev#/dev/} # sdb2
+  backupdev=$($READLINK -f "/sys/class/block/${backupdev}/..") # /sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host0/target0:0:0/0:0:0:0/block/sdb
+  backupdev=$($BASENAME "${backupdev}") # sdb <- https://unix.stackexchange.com/questions/308722/how-to-get-block-device-name-from-partition-device-name#308724
+
+  # Save the partition layout (200_partition_layout)
+  ### This works on a per device basis.
+  (
+    # Disk sizes
+    # format: disk <disk> <sectors> <partition label type>
+    for disk in /sys/block/* ; do
+      blockd=${disk#/sys/block/} # trim /sys/block/ prefix
+      if [[ $blockd == $backupdev ]]; then # sdb == sdb
+        continue # skip backup target drive
+      elif [[ $blockd = hd* || $blockd = sd* || $blockd = nvme* || $blockd = mmcblk* ]] ; then
+        devname=$(get_device_name $disk)
+        devsize=$(get_disk_size ${disk#/sys/block/})
+
+        if is_multipath_path ${blockd} ; then # Check if blockd is a path of a multipath device.
+          Log "Ignoring $blockd: it is a path of a multipath device"
+        elif [[ ! ($blockd = *rpmb || *[0-9]boot[0-9]) ]]; then # Silently skip Replay Protected Memory Blocks
+          disktype=$($PARTED -s $devname print | $GREP -E 'Partition Table|Disk label' | $CUT -d ':' -f '2' | $TR -d ' ')
+
+          echo "# Disk $devname"
+          echo "# Format: disk <devname> <size(bytes)> <partition label type>"
+          echo "disk $devname $devsize $disktype"
+
+          echo "# Partitions on $devname"
+          echo "# Format: part <device> <partition size(bytes)> <partition start(bytes)> <partition type|name> <flags> /dev/<partition>"
+          extract_partitions "$devname"
+        fi
+       fi
+    done
+) >> $DISKLAYOUT_FILE
+
+  unset -v disk blockd devname devsize disktype
+
+  # Save Filesystem layout (230_filesystem_layout)
+(
+    print_btrfs_default_subvolume=true # consecutive lines starting "Btrfs default subvolume ..." print without duplicating commenting header.
+    echo "# Filesystems (only $supported_filesystems are supported)."
+    echo "# Format: fs <device> <mountpoint> <fstype> [uuid=<uuid>] [label=<label>] [<attributes>]"
+    # Read the output of the read_filesystems_command
+    while read device mountpoint fstype options junk ; do
+        [[ -z "$device" || -z "$mountpoint" || -z "$fstype" ]] && { LogPrint "Empty device='$device' or mountpoint='$mountpoint' or fstype='$fstype', skipping saving filesystem layout for it."; continue; } # Empty device or mountpoint or fstype may may indicate an error. In this case be verbose and inform the user
+        [[ -b "$device" ]] || { Log "$device is not a block device, skipping."; continue; } # Skip saving filesystem layout for non-block devices
+        [[ "$fstype" = 'iso9660' ]] && { Log "$device is CD/DVD type device [fstype=$fstype], skipping."; continue; } # Skip saving filesystem layout for CD/DVD type devices
+        case "$mountpoint" in (/tmp/*|/mnt/*) continue ;; esac
+        #echo $mountpoint >&2
+
+        echo -n "fs $device $mountpoint $fstype"
+        case "$fstype" in
+          (ext*)
+              uuid=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -i 'UUID:' | $CUT -d ':' -f 2 )
+            echo -n " uuid=$uuid"
+              label=$( e2label $device )
+            echo -n " label=$label"
+              blocksize=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -i 'Blocksize:[0-9]*' | $CUT -d ':' -f 2 )
+            echo -n " blocksize=$blocksize"
+              # comment fragmentsize due mkfs.ext* option -f not existing (man page says it is)
+              #fragmentsize=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -oi 'Fragmentsize:[0-9]*' | $CUT -d ':' -f 2 )
+            #echo -n " fragmentsize=$fragmentsize"
+              nr_blocks=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -iv reserved | $GREP -i 'Blockcount:[0-9]*' | $CUT -d ':' -f 2 )
+              reserved_blocks=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -i 'Reservedblockcount:[0-9]*' | $CUT -d ':' -f 2 )
+              reserved_percentage=$(( reserved_blocks * 100 / nr_blocks ))
+              StopIfError 'Divide by zero detected'
+            echo -n " reserved_blocks=$reserved_percentage%"
+              max_mounts=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -i 'Maximummountcount:[0-9]*' | $CUT -d ':' -f 2 )
+            echo -n " max_mounts=$max_mounts"
+              check_interval=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -i 'Checkinterval:[0-9]*' | $CUT -d ':' -f 2 | $CUT -d '(' -f1 )
+              check_interval=$( is_numeric $check_interval )  # if non-numeric 0 is returned
+              let check_interval=$check_interval/86400 # translate check_interval from seconds to days
+            echo -n " check_interval=${check_interval}d"
+              nr_inodes=$( tune2fs -l $device | $TR -d '[:blank:]' | $GREP -i 'Inodecount:[0-9]*' | $CUT -d ':' -f 2 )
+              let "bytes_per_inode=$nr_blocks*$blocksize/$nr_inodes"
+              StopIfError 'Divide by zero detected'
+            echo -n " bytes_per_inode=$bytes_per_inode"
+              default_mount_options=$( tune2fs -l $device | $GREP -i 'Default mount options:' | $CUT -d ':' -f 2 | $AWK '{$1=$1};1' | $TR ' ' ',' | $GREP -v none )
+            [[ -n $default_mount_options ]] && echo -n " default_mount_options=$default_mount_options"
+            ;;
+          (vfat)
+            label=$( $LSBLK -no label $device )
+            uuid=$( $LSBLK -no uuid $device )
+            echo -n " uuid=$uuid label=$label"
+            ;;
+          (xfs)
+            Error "XFS on $device is an unsupported file system"
+            ;;
+          (reiserfs)
+            Error "Reiserfs on $device is an unsupported file system"
+            ;;
+          (btrfs)
+          	btrfs_devices_and_mountpoints+=" $device,$mountpoint" # Remember devices and mountpoints of the btrfs filesystems for the btrfs subvolume layout stuff below
+            uuid=$( btrfs filesystem show $device | $GREP -o 'uuid: .*' | $CUT -d ':' -f 2 | $TR -d '[:space:]' )
+            label=$( btrfs filesystem show $device | $GREP -o 'Label: [^ ]*' | $CUT -d ':' -f 2 | $TR -d '[:space:]' )
+            test 'none' = "$label" && label=
+            echo -n " uuid=$uuid label=$label"
+            ;;
+        esac
+        options=${options#(} # Remove parenthesis (from the traditional mount command output) from the list of options
+        options=${options%)}
+				options=${options//seclabel,/} #clip out the "seclabel" option to avoid problems, issue#545
+        echo -n " options=$options"
+        echo # Finish the current filesystem layout line with a newline character
+    done < <( eval $read_filesystems_command )
+
+    # ======================
+    # Btrfs subvolume layout 
+    # ======================
+    # if a btrfs filesystem exists
+    if test -n "$btrfs_devices_and_mountpoints" ; then
+      #echo "$btrfs_devices_and_mountpoints" >&2
+      # Btrfs subvolumes (regardless if mounted or not)
+      for btrfs_device_and_mountpoint in $btrfs_devices_and_mountpoints ; do
+        # Assume "/dev/sdX99,/my/mount,point" -> split at the first comma because device nodes (e.g. /dev/sdX99) do not contain a comma but a mount point directory name may contain a comma (e.g. /my/mount,point).
+        # If a mount point directory name contains space or tab characters it will break here because space tab and newline are standard bash internal field separators ($IFS)
+        btrfs_device=${btrfs_device_and_mountpoint%%,*}
+        btrfs_mountpoint=${btrfs_device_and_mountpoint#*,}
+        # -----------------------
+        # Btrfs default subvolume
+        # -----------------------
+        if $print_btrfs_default_subvolume; then
+          echo '# Btrfs default subvolume'
+          echo '# Format: btrfsdefaultsubvol <device> <mountpoint> <btrfs_subvolume_ID> <btrfs_subvolume_path>'
+          print_btrfs_default_subvolume=false
+        fi
+        ### $ btrfs subvolume get-default /
+        ### ID 5 (FS_TREE)
+        btrfs_default_subvolume_ID=$( btrfs subvolume get-default $btrfs_mountpoint | $TR -s '[:blank:]' ' ' | $CUT -d ' ' -f 2 )
+        btrfs_default_subvolume_path=$( btrfs subvolume get-default $btrfs_mountpoint | $TR -s '[:blank:]' ' ' | $CUT -d ' ' -f 9 )
+        # If there is no field 9 the default subvolume path is the filesystem root (called "top-level subvolume" or "FS_TREE" by btrfs).
+        # Denote the btrfs filesystem root by '/' (the only character that is really forbidden in directory names). Do not denote the filesystem root by 'FS_TREE' or by any word that is a valid directory name or btrfs subvolume name because an admin can create a btrfs subvolume with name 'FS_TREE' via: btrfs subvolume create FS_TREE
+        test -z "$btrfs_default_subvolume_path" && btrfs_default_subvolume_path='/'
+        # Empty btrfs_default_subvolume_ID may may indicate an error. In this case be verbose and inform the user:
+        if test -z "$btrfs_default_subvolume_ID" ; then
+          LogPrint "Empty btrfs_default_subvolume_ID, no btrfs default subvolume stored for $btrfs_device at $btrfs_mountpoint"
+        else
+          echo "btrfsdefaultsubvol $btrfs_device $btrfs_mountpoint $btrfs_default_subvolume_ID $btrfs_default_subvolume_path"
+        fi
+       	# -------------------------
+        # Btrfs snapshot subvolumes
+        # -------------------------
+        # In case of errors "btrfs subvolume list" results output on stderr but none on stdout-> the following test intentionally also fails in case of errors
+        if test $( btrfs subvolume list -as $btrfs_mountpoint | $WC -l ) -gt 0 ; then
+          snapshot_subvolume_list=$( btrfs subvolume list -as $btrfs_mountpoint | $TR -s '[:blank:]' ' ' | $CUT -d ' ' -f 2,14 | $SED -e 's/<FS_TREE>\///' )
+          prefix=$( echo "#btrfssnapshotsubvol $btrfs_device $btrfs_mountpoint" | $SED -e 's/\//\\\//g' )
+          echo '# Btrfs snapshot subvolumes are listed here only as documentation.'
+          echo '# There is no recovery of btrfs snapshot subvolumes.'
+          echo '# Format: btrfssnapshotsubvol <device> <mountpoint> <btrfs_subvolume_ID> <btrfs_subvolume_path>'
+          echo "$snapshot_subvolume_list" | $SED -e "s/^/$prefix /"
+        fi
+        # -----------------------
+        # Btrfs normal subvolumes
+        # -----------------------
+        # Are btrfs subvolumes that are no snapshot subvolumes.
+        # In case of errors "btrfs subvolume list" results output on stderr but none on stdout -> following test intentionally also fails in case of errors
+        if test $( btrfs subvolume list -a $btrfs_mountpoint | $WC -l ) -gt 0 ; then
+          subvolume_list=$( btrfs subvolume list -a $btrfs_mountpoint | $TR -s '[:blank:]' ' ' | $CUT -d ' ' -f 2,9 | $SED -e 's/<FS_TREE>\///' )
+          prefix=$( echo "btrfsnormalsubvol $btrfs_device $btrfs_mountpoint" | $SED -e 's/\//\\\//g' )
+          # Get the IDs of the snapshot subvolumes as pattern like egrep -v '^279 |^280 |^281 |^282 |^285 |^286 |^289 |^290 ' to exclude snapshot subvolume lines to get only the normal subvolumes.
+          # btrfs subvolume IDs are only unique for one same btrfs filesystem which is the case here because the btrfs_device_and_mountpoint is fixed herein and on one btrfs_device (e.g. /dev/sda2) there is only one btrfs filesystem.
+          # TODO: " sed | tr | sed " pipe is ugly 
+          snapshot_subvolumes_pattern=$( btrfs subvolume list -as $btrfs_mountpoint | $TR -s '[:blank:]' ' ' | $CUT -d ' ' -f 2 | $SED -e 's/^/^/' -e 's/$/ |/' | $TR -d '\n' | $SED -e 's/|$//' )
+          # Normal subvolumes that belong to snapper are excluded from being recreated  (see the code in layout/prepare/GNU/Linux/130_include_mount_subvolumes_code.sh) issues#944, issues#963.
+          snapper_base_subvolume="@/.snapshots"
+          subvolumes_exclude_pattern="$snapshot_subvolumes_pattern|$snapper_base_subvolume" # Exclude usual snapshot subvolumes and subvolumes that belong to snapper
+          # Output header
+          echo "# Btrfs normal subvolumes for $btrfs_device at $btrfs_mountpoint"
+          echo '# Format: btrfsnormalsubvol <device> <mountpoint> <btrfs_subvolume_ID> <btrfs_subvolume_path>'
+          # List subvolumes that belong to snapper as comments (deactivated) if such subvolumes exist. Have them before the other btrfs normal subvolumes because a single comment block looks less confusing and matches better to the directly before listed (deactivated) snapshot subvolumes 
+          if btrfs subvolume list -a $btrfs_mountpoint | $GREP -q "$snapper_base_subvolume" ; then
+            echo '# Btrfs subvolumes that belong to snapper are listed here only as documentation.'
+            echo "# Because any '@/.snapshots' subvolume would let 'snapper/installation-helper --step 1' fail"
+            echo "# such subvolumes are deactivated here to not let 'drp recover' fail:"
+            if test -z "$snapshot_subvolumes_pattern" ; then
+              echo "$subvolume_list" | $GREP "$snapper_base_subvolume" | $SED -e "s/^/#$prefix /" # With an empty snapshot_subvolumes_pattern egrep -v '' would exclude all lines
+            else
+              echo "$subvolume_list" | $GREP -ve "$snapshot_subvolumes_pattern" | $GREP "$snapper_base_subvolume" | $SED -e "s/^/#$prefix /"
+            fi
+          fi
+          # Output btrfs normal subvolumes:
+          if test -z "$subvolumes_exclude_pattern" ; then
+            echo "$subvolume_list" | $SED -e "s/^/$prefix /" # With an empty subvolumes_exclude_pattern egrep -v '' would exclude all lines
+          else
+            echo "$subvolume_list" | $GREP -ve "$subvolumes_exclude_pattern" | $SED -e "s/^/$prefix /"
+          fi
+        fi
+      done
+      # ------------------------
+      # Mounted btrfs subvolumes
+      # ------------------------
+      # Use the "findmnt -m" to use /etc/mtab instead of /proc/self/mountinfo; improves SAN multipath root devices
+      read_mounted_btrfs_subvolumes_command="$FINDMNT -mnrv -o SOURCE,TARGET,OPTIONS,FSROOT -t btrfs"
+      readonly findmnt_FSROOT_works='yes'
+      while read device subvolume_mountpoint mount_options btrfs_subvolume_path junk ; do
+        # Skip temporary mounts, like this build mount
+        case "$subvolume_mountpoint" in (/tmp/*|/mnt/*) continue ;; esac
+        # Work with the persistent dev name
+        # Address the fact than dm-XX may be different disk in the recovery environment, see https://github.com/rear/rear/pull/695
+        device=$( get_device_mapping $device )
+        device=$( get_device_name $device )
+        # Output btrfsmountedsubvol entries
+        if test -n "$device" -a -n "$subvolume_mountpoint" ; then
+          if test -z "$btrfsmountedsubvol_entry_exists" ; then
+            btrfsmountedsubvol_entry_exists='yes' # Output header only once
+            echo '# All mounted btrfs subvolumes (including mounted btrfs default subvolumes and mounted btrfs snapshot subvolumes).'
+            echo '# Determined by the findmnt command that shows the mounted btrfs_subvolume_path.'
+            echo '# Format: btrfsmountedsubvol <device> <subvolume_mountpoint> <mount_options> <btrfs_subvolume_path>'
+            print_btrfs_default_subvolume=false
+          fi
+          mount_options=${mount_options#(} # Remove parenthesis (from the traditional mount command output) from the list of mount options
+          mount_options=${mount_options%)}
+          if test -z "$btrfs_subvolume_path" ; then
+            # When btrfs_subvolume_path is empty try to find the mountpoint in /etc/fstab and try to read the subvol=... option value if exists; note: (using subvolid=... can fail because the subvolume ID can be different during system recovery).
+            # Because both "mount ... -o subvol=/path/to/subvolume" and "mount ... -o subvol=path/to/subvolume" work the subvolume path can be specified with or without leading '/'
+            btrfs_subvolume_path=$( $GREP -e "[[:space:]]$subvolume_mountpoint[[:space:]]+btrfs[[:space:]]" /etc/fstab \
+                                      | $GREP -ve '^[[:space:]]*#' \
+                                      | $GREP -o 'subvol=[^ ]*' | $CUT -s -d '=' -f 2 )
+          fi
+          # Remove leading '/' from btrfs_subvolume_path (except it is only '/') to have same syntax for all entries and without leading '/' is more clear that it is not an absolute path in the currently mounted tree of filesystems
+          test '/' != "$btrfs_subvolume_path" && btrfs_subvolume_path=${btrfs_subvolume_path#/}
+          echo "btrfsmountedsubvol $device $subvolume_mountpoint $mount_options $btrfs_subvolume_path"
+        fi
+      done < <( eval $read_mounted_btrfs_subvolumes_command )
+      # No copy on write attributes of mounted btrfs subvolumes
+      echo '# Mounted btrfs subvolumes that have the "no copy on write" attribute set.'
+      echo '# Format: btrfsnocopyonwrite <btrfs_subvolume_path>'
+      # Use the "findmnt -m" to use /etc/mtab instead of /proc/self/mountinfo; improves SAN multipath root devices
+      for subvolume_mountpoint in $( $FINDMNT -mnrv -o TARGET -t btrfs ) ; do
+        # The 'no copy on write' attribute is shown as 'C' in the lsattr output (see "man chattr")
+        if $LSATTR -d $subvolume_mountpoint | $CUT -d ' ' -f 1 | $GREP -q 'C' ; then
+          btrfs_subvolume_path=$( $FINDMNT -mnrv -o FSROOT $subvolume_mountpoint )
+          # Remove leading '/' from btrfs_subvolume_path (except it is only '/') to have same syntax for all entries and without leading '/' is more clear that it is not an absolute path in the currently mounted tree of filesystems
+          test '/' != "$btrfs_subvolume_path" && btrfs_subvolume_path=${btrfs_subvolume_path#/}
+          if test -n "$btrfs_subvolume_path" ; then
+            echo "btrfsnocopyonwrite $btrfs_subvolume_path"
+          else
+            echo "# $subvolume_mountpoint has the 'no copy on write' attribute set but $findmnt_command does not show its btrfs subvolume path"
+          fi
+        fi
+      done
+    fi
+) >> $DISKLAYOUT_FILE
+
+  unset -v print_btrfs_default_subvolume
+
+  # Save Swap layout to DISKLAYOUT_FILE (240_swaps_layout)
+  (
+    echo '# Swap partitions or swap files'
+    echo '# Format: swap <filename> uuid=<uuid> label=<label>'
+
+    while read filename type junk ; do
+        [[ $filename == 'Filename' || $type == 'file' ]] && continue # skip heading line
+        # if filename is on a lv, try to find the DM name
+        for dlink in $( ls /dev/mapper/* ) ; do
+          target=$( $READLINK -f "$dlink" )
+          if [[ $target == $filename ]] ; then
+            filename=$dlink
+            break
+          fi
+        done
+        # find uuid or label
+        if has_binary swaplabel; then
+          while read what value junk; do
+            case $what in
+              (UUID:) uuid=$value ;;
+              (LABEL:) label=$value ;;
+            esac
+          done < <( swaplabel $filename )
+				elif has_binary lsblk; then
+				  uuid=$( lsblk -no uuid $filename  2>/dev/null )
+					label=$( lsblk -no label $filename  2>/dev/null )
+        fi
+        echo "swap $filename uuid=$uuid label=$label"
+    done < /proc/swaps
+) >> $DISKLAYOUT_FILE
+
+  # TODO: Save DRBD (250_drbd_layout)
+  # TODO: Append /etc/drbdtab to the list of mountpoints, if it exists (350_copy_drbdtab)
+  # TODO: lvm (500_extract_vgcfg.sh)
+  # TODO?: Save GPT bootstrap code?
+
+  # List deps (/prepare/default/510_list_dependencies.sh)
+  # 
+  # input : $DISKLAYOUT_FILE
+  # output: $DISKLAYOUT_DEPS
+  #         $DISKLAYOUT_TODO
+  generate_layout_dependencies
+
+  # Save the current disk usage (POSIX output format) in the rescue image (510_current_disk_usage.sh)
+  # exclude resolved destinations EFI_PART / DATA_PART
+  #   -P  use the POSIX output format
+  #    -l  limit listing to local file systems
+  #     -h  print sizes in powers of 1024 (e.g., 1023M)
+  #[[ $v='-v' ]] && set -x
+  $DF -Plh -x encfs -x tmpfs -x devtmpfs | \
+    $GREP --invert-match -e "^`$READLINK -f "$EFI_PART"`" -e "^`$READLINK -f "$DATA_PART"`" \
+    > $TMP_DIR/layout/config/df.txt
+  #[[ $v='-v' ]] && set -
+
+  # Human information of relevance to recreate this system (990_sysreqs.sh)
+  {
+  echo
+  printf '%s\n' "Hostname        : $( has_binary hostname && hostname || $UNAME -n )"
+  echo
+  printf '%s\n' "Operating system: $( /usr/bin/lsb_release  --short --description )"
+  printf '%s\n' "uname -r        : $( $UNAME -r )"
+  echo
+  memory_in_kB=$( $GREP MemTotal /proc/meminfo | $CUT -d: -f2 | $SED 's/kB//' ) # this excludes kernel memory (how to determine this?)
+  $GREP 'model name' /proc/cpuinfo # model name : Intel(R) Atom(TM) CPU  E3815  @ 1.46GHz
+  $GREP 'cpu cores' /proc/cpuinfo  # cpu cores  : 1
+  printf '%s\n' "physical memory : $(( memory_in_kB / 1024 )) MiB"
+  echo
+  # VG information
+  if hash vgs 2>/dev/null; then
+    echo 'Volume Group info:'
+    vgs --units=g
+    echo
+  fi
+  if hash lvs 2>/dev/null; then
+    echo 'Logical Volume Groups info:'
+    lvs --units=g
+    echo
+  fi
+  echo 'Disk space requirements:'
+  while read junk dev size label
+  do
+     echo "Device $dev has a size of $((size/1024/1024/1024)) Gib (label $label)"
+  done < <( $GREP '^disk' $DISKLAYOUT_FILE )
+  echo
+  echo 'Network Information:'
+  echo '  IP adresses:'
+  ip addr show | $GREP inet | $GREP -v 127.0.0. | $SED -e 's/ brd.*//' -e 's/inet6//' -e 's/inet//' | while read ip ; do
+      if hash dig 2>/dev/null; then
+          DNSname="$( dig +time=1 +tries=1 +short -x ${ip%/*} )"
+      else
+          DNSname=''
+      fi
+      if test -z "$DNSname" ; then
+          echo "    ip ${ip%/*} subnet /${ip#*/}"
+      else
+          echo "    ip ${ip%/*} subnet /${ip#*/} DNS name $DNSname"
+      fi
+  done
+
+  echo '  Default route:'
+  ip route show | $GREP default | $CUT -d' ' -f3 | $SED -e 's/^/    /'
+  echo
+  } >$TMP_DIR/Minimal_System_Requirements.txt
+
+  has_binary dmidecode && dmidecode -qt 17 >$TMP_DIR/Memory_device.txt
+
+  # save permissions, owner, group or symbolic link name and target of basic directories (400_save_directories.sh) 
+  # /boot 755 root root
+  # /dev 755 root root
+  # /dev/shm 1777 root root
+  # /dev/pts 755 root root
+  # /dev/hugepages 755 root root
+  # /dev/mqueue 1777 root root
+  # /home 755 root root
+  # /proc 555 root root
+  # /run 755 root root
+  # /sys 555 root root
+  directories_permissions_owner_group_file="$TMP_DIR/recovery/directories_permissions_owner_group"
+  : >"$directories_permissions_owner_group_file" # create 0-byte file
+  mountpoints="$( $FINDMNT -runit \'$MPT_EXCLUDE_FS\' -o TARGET )"
+  for directory in $mountpoints ; do
+    case $directory in
+      (/|/sys/*|/tmp|/tmp/*|/mnt/*|/media/*) continue ;;
+      (*) $STAT -c '%n %a %U %G' "$directory" >>"$directories_permissions_owner_group_file" ;;
+    esac
+  done
+  unset -v directory mountpoints
+  
+  for directoryglob in $FHS_DIRECTORIES ; do
+    for directory in $( echo $directoryglob ) ; do
+      $GREP -q "^$directory" "$directories_permissions_owner_group_file" 1>&2 && continue # skip when already listed
+      [[ ! -d "$directory" ]] && continue # skip when not existing
+      if [[ -L "$directory" ]] ; then # is symbolic link
+        $STAT -c '%N' "$directory" | $TR -d '\047' >>"$directories_permissions_owner_group_file" # /bin -> usr/bin :: symbolic links are output different than normal directories
+      else
+        $STAT -c '%n %a %U %G' "$directory" >>"$directories_permissions_owner_group_file" # /bin 755 root root
+      fi
+    done
+  done
+  unset -v directoryglob directory directories_permissions_owner_group_file
+
+  # Only copy (with target backup) when changed
+  readonly files_to_process=( 
+    "$DISKLAYOUT_FILE"
+    "$DISKLAYOUT_DEPS"
+    "$DISKLAYOUT_TODO"
+    "$TMP_DIR/layout/config/df.txt"
+    "$TMP_DIR/Memory_device.txt"
+    "$TMP_DIR/Minimal_System_Requirements.txt"
+    "$TMP_DIR/recovery/directories_permissions_owner_group"
+    "$TMP_DIR/recovery/diskbyid_mappings" )
+  for file in ${files_to_process[@]}; do
+    install_file $file ${file/#$TMP_DIR/$VAR_DIR}
+    $RM -f $file
+  done
+  unset -v file
+
+  
+  # TODO: Generate backups/checksums (600_snapshot_files)
+
+
+
+  # Stage 2/2: Data
+  # ===========================================================================================
+
+  if [[ ! -f $RSYNC_FILTER ]]; then
+    # with tab stripping
+    $CAT <<-'EOF' > $RSYNC_FILTER
+# Version 0.00 20171213
+#
+# notes:
+#  * be careful with trailing spaces, '- * ' is different from '- *'
+#  * '+ */' includes all folders
+#  * '- *' exclude all non explicited files
+#  * rsync stops at first matched rule and ignore the rest
+#  * rsync descends iteratively the folders-arborescence
+#  * double stars "**" means "any path", matches zero, one or several '/'
+#  * triple stars "***" means "any path, including this very directory"
+#  * '+ /etc/ssh/**  + */  - *' exclude everything except /etc/ssh
+#  * '- /tmp/*  + */' exclude content of /tmp but include foldername
+#  * '- /tmp/  + */' exclude content and also foldername
+#  * '- /**/.ssh/*  + */' exclude content of each .ssh but include foldername
+#  * '- /tmp/*' include everything except /tmp/ but include /tmp/ as an empty folder
+#  * '- /tmp/' include everything except /tmp/
+#  include only /var/www/:
+#    + /var/
+#    + /var/www/
+#    + /var/www/**
+#    - *
+#  almost same, includes all directories though empty:
+#    + /**/
+#    + /var/www/***
+#    - *
+#  same but also include folder structure:
+#    + /var/www/**
+#    + */
+#    - *
+
+# pattern list for / (include list type by default):
++ /
+- /lost+found/*
+- /media/*
+- /mnt/*/*
+#- /postgresql/*/main/pg_log/*
+#- /postgresql/*/main/pg_xlog/*
+#- /postgresql/*/main/postmaster.opts
+#- /postgresql/*/main/postmaster.pid
+#- /postgresql/*/main/*/*
+- /proc/*
+- /dev/*
+- /root/tmp/*
+- /run/*
+- /sys/*
+- /tmp/*
+#- /var/cache/*
+- /var/cache/pacman/pkg/*
+#______Explicit_include____________
++ /var/
++ /var/lib/
++ /var/lib/drp/
++ /var/lib/drp/**
+#______Don't_exclude_!!!___________
+#- /var/lib/mysql/*
+#- /var/lib/postgresql/*/main/*/*
+#- /var/log/*
+#- /var/spool/*
+#- /var/tmp/*
++ /boot/
++ /boot/**
++ /home/
+- /home/lost+found/*
+- /home/*/.gvfs
+#- /home/*/.thumbnails/*
+#- /home/*/.cache/mozilla/*
+#- /home/*/.cache/chromium/*
+#- /home/*/.local/share/Trash/*
++ /home/**
++ */
++ *
+EOF
+  fi
+
+  #/Backups.backupdb/hostname/YY-MM-DD-HHMMSS/Volume Name/
+  #/Backups.backupdb/hostname/YY-MM-DD-HHMMSS.inProgress/D62929AA-7909-4CE0-8E56-1289A37EA7C7/Volume Name/
+  #/Backups.backupdb/hostname/Latest
+  readonly SNAPSHOT_DST=$DATA_MPT'/Backups.backupdb'
+  readonly HOST_SRC=$HOST_LOCAL
+  readonly LATEST='Latest'
+
+  if [[ "$1" == '--prepare' ]]; then
+    if [[ "$REPLY" != "No" ]]; then
+      # once create /Backups.backupdb/host_name folder
+      $MKDIR $SNAPSHOT_DST
+      $MKDIR $SNAPSHOT_DST/$HOST_SRC
+    fi
+  fi
+
+  #     -L: True if FILE exists and is a symbolic link.
+  if [[ -L "$SNAPSHOT_DST/$HOST_SRC/$LATEST" ]]; then
+    # Create snapshot for dry-run
+    $BTRFS subvolume snapshot "$SNAPSHOT_DST/$HOST_SRC/$LATEST" "$SNAPSHOT_DST/$HOST_SRC/$LATEST.test-free-disk-space" ||  exit 253  
+    #$INSTALL $v -m755 -d "$SNAPSHOT_DST/$HOST_SRC/$LATEST.test-free-disk-space"
+    # emtpy log
+    : >"$SNAPSHOT_DST/$HOST_SRC/dr-$LOG"
+
+  	# 1/5 attempt dry-run
+    # --include/--exclude needs curly brace expansion
+    #[[ $v == '-v' ]] && set -x
+    eval $RSYNC_NICE \
+      --dry-run $v \
+      ${RSYNC_OPTIONS/--human-readable/} \
+      --include="{/var/,/var/lib/,/var/lib/drp/,'/var/lib/drp/**'}" \
+      --exclude="{'/dev/*','/proc/*','/sys/*','/tmp/*','/run/*','/mnt/*','/media/*',/lost+found,'/home/*/.gvfs'}" \
+      --filter=\'merge $RSYNC_FILTER\' \
+      $LNKDST \
+      $SOURCE "$SNAPSHOT_DST/$HOST_SRC/$LATEST.test-free-disk-space" >>"$SNAPSHOT_DST/$HOST_SRC/dr-$LOG"
+    #[[ $v == "-v" ]] && set -
+    Result=$?
+    #  Success        Partial transfer due to error   Partial transfer due to vanished source files   
+    if [ "$Result" -ne 0 ] && [ "$Result" -ne 23 ] && [ "$Result" -ne 24 ]; then
+      case $Result in
+        (1) echo 'Rsync, syntax or usage error' >&2 ;;
+        (2) echo 'Rsync, protocol incompability' >&2 ;;
+        (3) echo 'Rsync, errors selecting input/output files, dirs' >&2 ;;
+        (4) echo 'Rsync, requested action not supported: an attempt was made to manipulate 64-bit files on a platform that cannot support them; or an option was specified that is supported by the client and not by the server.' >&2 ;;
+        (5) echo 'Rsync, error starting client-server protocol' >&2 ;;
+        (6) echo 'Rsync, daemon unable to append to log-file' >&2 ;;
+        (10) echo 'Rsync, error in socket I/O' >&2 ;;
+        (11) echo 'Rsync, error in file I/O' >&2 ;;
+        (12) echo 'Rsync, error in rsync protocol data stream' >&2 ;;
+        (13) echo 'Rsync, errors with program diagnostics' >&2 ;;
+        (14) echo 'Rsync, error in IPC code' >&2 ;;
+        (20) echo 'Rsync, received SIGUSR1 or SIGINT' >&2 ;;
+        (21) echo 'Rsync, some error returned by CWwaitpid()' >&2 ;;
+        (22) echo 'Rsync, error allocating core memory buffers' >&2 ;;
+        (25) echo 'Rsync, the --max-delete limit stopped deletions' >&2 ;;
+        (30) echo 'Rsync, timeout in data send/receive' >&2 ;;
+        (35) echo 'Rsync, timeout waiting for daemon connection' >&2 ;;
+        (*) echo "Unknown error ($Result) in rsync execution. Exiting..." >&2
+      esac
+      echo "$( $DATE +%Y-%m-%d_%H:%M:%S ) $HOST_SRC: === Snapshot failed. ===" >&2
+      exit 2 #TODO: jump to remount read-only -> Trap block
+    fi
+    tmp=$(tail -24 "$SNAPSHOT_DST/$HOST_SRC/dr-$LOG" | grep 'Total transferred file size:' | cut -d ' ' -f5)
+    let i=$(((${tmp//,/}+524288)/1048576))
+    unset tmp
+    echo "Drp snapshot: ${i} MiB needed."
+    
+    # cleanup
+    $RM $v -rf "$SNAPSHOT_DST/$HOST_SRC/dr-$LOG"
+    # cleanup temporary subvolume
+    $BTRFS subvolume delete "$SNAPSHOT_DST/$HOST_SRC/$LATEST.test-free-disk-space"
+    #$RM $v -rf "$SNAPSHOT_DST/$HOST_SRC/$LATEST.test-free-disk-space"
+
+
+    # 2/5 clean-up old back-ups (snapshots) to make enough free disk space
+    
+    # Snapshot space consumption
+    #
+    # btrfs filesystem du -s /mnt/sdb2/Backups.backupdb/d2/Latest
+    #   Total   Exclusive  Set shared  Filename
+    # 1.44GiB     8.00KiB     1.44GiB  /mnt/sdb2/Backups.backupdb/host_name/Latest
+
+    # hourly, daily, weekly retention / backup thinning
+    # read list and sort old to new
+
+    # [A] read dir names sorted using ls
+    # for i in `cd $SNAPSHOT_DST/$HOST_SRC >/dev/null;ls -dv 2[0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9];cd - >/dev/null`; do 
+    #   #echo $i
+    #   strDateIn="${i::10} ${i:11:2}:${i:13:2}:${i:15:2}"
+    #   strDateOut=$($DATE --date="$strDateIn" +'%F %T')
+    #   [[ $strDateIn == $strDateOut ]] || echo "$strDateIn != $strDateOut"
+    # done
+
+    # [B] read dir names without ls
+    pushd "$SNAPSHOT_DST/$HOST_SRC" >/dev/null
+    declare -a arrFiles
+    arrFiles=(2[0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]) # BASH glob is auto sorted low to high
+    popd >/dev/null
+    # echo ${arrFiles[*]}
+
+    # Build epoch time array
+    declare -ai arrSinceEpoch
+    declare -i lastEpoch intTZ
+    # Calculate time zone correction in seconds
+    tmpTZ=$($DATE +%z) # f.e. +0100 -> +3600 seconds
+    (( intTZ = (${tmpTZ::3} * 3600) + (${tmpTZ:3:2} * 60) ))
+    unset tmpTZ
+    
+    for c in ${!arrFiles[@]}; do
+      # Replace dash between date and time by space
+      # Replace dashes between time segments by colons
+        # because:
+        # date --date='2017-12-17-235559' +%s 
+        # date: invalid date '2017-12-17-235559'
+        # date --date="2017-12-17 23:55:59" +%s
+        # 1513551359
+      i=${arrFiles[$c]}
+      strDateIn="${i::10} ${i:11:2}:${i:13:2}:${i:15:2}"
+      #               -d --date   display time described by STRING, not 'now'
+      #                                              %s   seconds since 1970-01-01 00:00:00 UTC
+      strDateOut=$($DATE --date="$strDateIn" +'%F %T')
+      (( arrSinceEpoch[$c]=$($DATE --date="$strDateIn" +%s) + intTZ ))
+      # test sorting order
+      [[ -n $lastEpoch && $lastEpoch -gt ${arrSinceEpoch[$c]} ]] && Error "Unexpected sorting order"
+      lastEpoch=arrSinceEpoch[$c]
+      # test date conversion
+      [[ $strDateIn == $strDateOut ]] || Error "$strDateIn != $strDateOut"
+    done
+
+    if [[ $v='-v' ]]; then
+      # First = oldest
+      echo -n "Oldest backup: ${arrFiles[0]}" # 2017-12-17-211627  
+      echo "  (${arrSinceEpoch[0]})"          # (1513541787)
+      # Last = newest
+      echo -n "Newest backup: ${arrFiles[-1]}"
+      echo "  (${arrSinceEpoch[-1]})"
+    fi
+
+    declare -i intNewest intUpperLimit
+    declare -ai arrToBeRemoved
+    intNewest=${arrSinceEpoch[-1]}
+    ((intUpperLimitMinusSeven=intNewest-86400)) #24*3600 seconds
+    ((intUpperLimitMinusThirty=intNewest-2592000)) #30*86400 seconds
+    # [[ $v='-v' ]] && echo "intUpperLimitMinusThirty=$intUpperLimitMinusThirty"
+    
+    # Retention Rules
+    # - don't touch newest 24h versions
+    # - from old to new, keep only 1st version per day until newest-24 hours is reached
+    # - from old to new, keep oldest backup, and store versions that are at least 7 days newer as the previous
+    #   until newest-30 days is reached
+
+    # 1/2 Thinning to 1 version per day
+    lastday=''
+    for c in ${!arrFiles[@]}; do
+      if [[ ${arrSinceEpoch[$c]} -gt $intUpperLimitMinusSeven ]]; then
+        [[ $v='-v' ]] && echo "<24h: ${arrFiles[$c]}, [$c]"
+        break # exit for loop because all (remaining) backups are made within 24 hours of the "latest" backup
+      elif [[ -n $lastday && $lastday == ${arrFiles[$c]::10} ]]; then
+         # duplicate day found -> add this snapshot to the to-be-removed array
+         [[ $v='-v' ]] && echo "Remove snapshot: ${arrFiles[$c]}, [$c]"
+         arrToBeRemoved[$c]=1
+      fi
+      lastday=${arrFiles[$c]::10}
+    done
+
+    # 2/3 Thinning to 1 version per week
+    # fulldate to day: 2017-12-21-164100 -> 1513541787 -> /86400 -> day# 17517
+    # save snap when snap day >= last week snap day + 7 days
+    # TODO: improve to allow some rounding: f.e. not delete #6 in 1,6,14,21
+    declare -i idxLastSavedWeekSnap intLastSavedWeekSnapDay intTemp
+    idxLastSavedWeekSnap=0
+    intLastSavedWeekSnapDay=$((${arrSinceEpoch[0]}/86400)) # epoch seconds to day number
+    
+    for c in ${!arrFiles[@]}; do
+      #[[ $v='-v' ]] && echo "c: $c, arrSinceEpoch[c]: ${arrSinceEpoch[$c]}"
+      if [[ ${arrSinceEpoch[$c]} -gt $intUpperLimitMinusThirty ]]; then
+        #[[ $v='-v' ]] && echo "<30d: ${arrFiles[$c]}, [$c]"
+        break # exit for loop because all (remaining) backups are made within 30 days of the "latest" backup
+      elif [[ $c = 0 ]]; then
+        continue # skip this snap, always keep 1st snapshot
+      elif [[ ${arrToBeRemoved[$c]} = 1 ]]; then
+        continue # skip this snap, already marked for deletion
+      else
+        intTemp=${arrSinceEpoch[$c]}/86400
+        #[[ $v='-v' ]] && echo "  intTemp: $intTemp, intLastSavedWeekSnapDay+7: $(($intLastSavedWeekSnapDay+7))"
+        if [[ $intTemp -ge $(( $intLastSavedWeekSnapDay + 7 )) ]]; then
+          intLastSavedWeekSnapDay=$intTemp
+        else
+          arrToBeRemoved[$c]=1
+        fi
+      fi 
+    done
+
+    # print array count & indexes
+    if [[ $v='-v' && -n ${!arrToBeRemoved[@]} ]]; then
+      echo -n "To be removed (${#arrToBeRemoved[@]}): "
+      printf '#%s ' "${!arrToBeRemoved[@]}"
+      echo
+    fi
+    
+    # 3/3 If there are snapshots to-be-removed
+    if [[ -n ${!arrToBeRemoved[@]} ]]; then
+      # delete corresponding snapshots
+      for c in ${!arrToBeRemoved[@]}; do
+        #[[ $v='-v' ]] && echo -n "btrfs subvolume delete $SNAPSHOT_DST/$HOST_SRC/${arrFiles[$c]};"
+        if [[ $v='-v' ]]; then
+          $BTRFS subvolume delete $SNAPSHOT_DST/$HOST_SRC/${arrFiles[$c]}
+        else
+          $BTRFS subvolume delete $SNAPSHOT_DST/$HOST_SRC/${arrFiles[$c]} >/dev/null
+        fi
+      done
+      #[[ $v='-v' ]] && echo
+    fi
+  fi
+
+  # 3/5 make snapshot (directory)
+  # /Backups.backupdb/host_name/YY-MM-DD-HHMMSS.inProgress/
+  readonly strDate=$($DATE +%Y-%m-%d-%H%M%S)
+  if [[ -d "$SNAPSHOT_DST/$HOST_SRC/$strDate" ]]; then
+    echo "'$SNAPSHOT_DST/$HOST_SRC/$strDate' already exists."
+    exit 3
+  elif [[ -d "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" ]]; then
+    echo "'$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress' already exists."
+    exit 3
+  fi
+  #     -L: True if FILE exists and is a symbolic link.
+  if [[ -L "$SNAPSHOT_DST/$HOST_SRC/$LATEST" ]]; then
+    # Create snapshot (2nd and later backups)
+    $BTRFS subvolume snapshot "$SNAPSHOT_DST/$HOST_SRC/$LATEST" "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" ||  exit 253
+  else
+    # Create subvolume (1st backup)
+    $BTRFS subvolume create "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" || exit 252
+  fi
+
+  # 4/5 final rsync
+  # empty log
+  : >"$SNAPSHOT_DST/$HOST_SRC/$LOG"
+  eval $RSYNC_NICE \
+    -vv \
+    $RSYNC_OPTIONS \
+    --include="{/var/,/var/lib/,/var/lib/drp/,'/var/lib/drp/**'}" \
+    --exclude="{'/dev/*','/proc/*','/sys/*','/tmp/*','/run/*','/mnt/*','/media/*',/lost+found,'/home/*/.gvfs'}" \
+    --filter=\'merge $RSYNC_FILTER\' \
+    $LNKDST \
+    $SOURCE "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" >>"$SNAPSHOT_DST/$HOST_SRC/$LOG"
+  Result=$?
+  if [ "$Result" -ne 0 ] && [ "$Result" -ne 23 ] && [ "$Result" -ne 24 ]; then
+    echo "Sorry, error in rsync execution (value $Result). Exiting..."
+    echo "$($DATE +%Y-%m-%d_%H:%M:%S) $HOST_SRC: === Snapshot failed. ==="
+    exit 3
+  fi
+
+  # 5/5 move in place
+
+  # make subvolume readonly
+  $BTRFS property set "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" ro true
+  #BTRFS property set "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" ro false
+  # rename <DATE>.inProgress snapshot to <DATE>
+  #      -T  treat DEST as a normal file
+  #       -n  do not overwrite an existing file
+  readonly strEndDate=$($DATE +%Y-%m-%d-%H%M%S)
+  $MV $v -Tn "$SNAPSHOT_DST/$HOST_SRC/$strDate.inProgress" "$SNAPSHOT_DST/$HOST_SRC/$strEndDate"
+  StopIfError "$SNAPSHOT_DST/$HOST_SRC/$strEndDate already exists, discarding new backup."
+  
+  # link /Backups.backupdb/host_name/Latest to newest backup
+  #
+  # directly writing the new symbolic link over the old one fails 
+  # -> create temporary symbolic link
+  $LN $v -s "./$strEndDate" "$SNAPSHOT_DST/$HOST_SRC/$LATEST.Temporary"
+  # and move the temporary symbolic link in place
+  #      -f  force, do not prompt before overwriting
+  $MV $v -Tf "$SNAPSHOT_DST/$HOST_SRC/$LATEST"{.Temporary,} 
+
+	# optional: now remount the RW snapshot mountpoint as read-only
+  # why mount /dev/sdBackup at all?
+	#$MOUNT -o remount,ro $MOUNT_DEVICE $SNAPSHOT_RW
+	#if (( $? )); then
+	#	$ECHO "snapshot: could not remount $SNAPSHOT_RW readonly" >&2
+	#	exit 2
+	#fi
+fi
+
+# check/create SYSTEMD job that runs (this script) hourly
+#
+$CAT <<-EOF > $TMP_DIR/drp.service
+[Unit]
+Description=Backup Linux system for disaster recovery protection
+
+[Service]
+Type=simple
+ExecStart=$SCRIPT_FILE --mkbackup
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# hourly → *-*-* *:00:00
+$CAT <<-'EOF' > $TMP_DIR/drp.timer
+[Unit]
+Description=Execute system backup every hour
+
+[Timer]
+OnCalendar=*-*-* *:00:00
+Unit=drp.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Only copy (with target backup) when changed
+readonly files_to_process2=( 
+  "$TMP_DIR/drp.service"
+  "$TMP_DIR/drp.timer" )
+for file in ${files_to_process2[@]}; do
+  install_file $file ${file/#$TMP_DIR/$SYSTEMD_DIR}
+  $RM -f $file
+done
+unset -v file
+
+if [[ "`$SYSTEMCTL is-enabled drp.timer`" == 'disabled' ]]; then
+  $SYSTEMCTL enable drp.timer # Enable a unit to be started on bootup
+fi
+if [[ "`$SYSTEMCTL is-active drp.timer`" == 'inactive' ]]; then
+  $SYSTEMCTL start drp.timer
+fi
+
+# apply config changes
+  # systemctl reload drp.timer
+# stop running permanently
+  # systemctl stop drp.timer && systemctl disable drp.timer
+# manual start running permanently
+  # systemctl start drp.timer && systemctl enable drp.timer
+# query status
+  # systemctl status drp.timer
+
+if [[ -d $BUILD_DIR || -d $TMP_DIR ]]; then
+  # cleanup /tmp build dir
+  #[[ $v='-v' ]] && $RM -rfv $BUILD_DIR
+  $RM -rf $BUILD_DIR #>&2
+fi
+
+# TODO: after restore (900_create_missing_directories.sh)
+
+
+# ------------- contributed codes -------------------------------------------
+# <http://www.mikerubel.org/computers/rsync_snapshots/>
+# <https://github.com/jonhiggs/btrfs-time-machine/blob/master/time_machine>
+# <https://lwn.net/Articles/579009/>
+# <http://www.pointsoftware.ch/en/howto-local-and-remote-snapshot-backup-using-rsync-with-hard-links/>
+# <https://wiki.archlinux.org/index.php/Rsync#Full_system_backup>
+# <https://github.com/rear/rear>
+# <http://mywiki.wooledge.org/BashGuide>
+# <https://wiki.archlinux.org/index.php/Install_from_existing_Linux>
+# <https://wiki.gentoo.org/wiki/Custom_Initramfs>
+# <https://git.archlinux.org/mkinitcpio.git/>
+# <https://github.com/grazzolini/mkinitcpio-dropbear/>
+# <https://github.com/grazzolini/mkinitcpio-netconf/>
+# <https://wiki.archlinux.org/index.php/Migrate_installation_to_new_hardware>
+# <https://www.dwheeler.com/essays/filenames-in-shell.html>
+# <https://github.com/oxplot/rsyncbtrfs/blob/master/rsyncbtrfs>
+# <https://git.archlinux.org/mkinitcpio.git/tree/functions>
+# <https://git.archlinux.org/mkinitcpio-nfs-utils.git/tree/ipconfig/README>
