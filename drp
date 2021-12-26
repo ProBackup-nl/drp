@@ -1837,7 +1837,7 @@ $MKDIR -p $v $TMP_DIR >&2 || StopIfError "Could not create $TMP_DIR"
 
 # ------------- the make bootable phase ------------------------------------------
 if [[ "$1" == '--mkboot' || "$1" == '--prepare' || "$1" == '--mkbackup' ]]; then
-  #echo "Make bootable______($KMODULEDIR)"
+  echo "Make bootable______($KMODULEDIR)"
   #umask 0077
   if [[ ! -b ${EFI_PART} ]]; then
     Error "${EFI_PART} is not available"
@@ -2525,7 +2525,9 @@ EOF
       StopIfError "Failed to create <tmp>/loader.conf"
       install_file "$BUILD_DIR/loader.conf" "$EFI_MPT/loader/loader.conf"
   		StopIfError "Failed to create <esp>/loader/loader.conf"
-    fi #end make initramfs 
+    fi #end make initramfs
+  else
+     echo "Module dir not found: $KMODULEDIR"
   fi #end kernel
 
 	#TODO: install Rescue Boot Manager menu entry 
