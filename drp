@@ -165,7 +165,11 @@ readonly SYSTEMCTL='/usr/bin/systemctl'
 readonly MKFS_BTRFS='/usr/bin/mkfs.btrfs'
 # ------------- 
 readonly HOST_LOCAL="`$UNAME -n`" #network node hostname
-readonly KERNELVERSION=`$UNAME -r` #4.13.12-1-ARCH
+readonly KERNEL_FILE='/boot/vmlinuz-linux'
+# kernel version in memory
+# readonly KERNELVERSION=`$UNAME -r`
+# kernel version on disk (to handle os update without reboot)
+readonly KERNELVERSION=`$FILE -b $KERNEL_FILE | $SED -n '/version /!q1;s/.*version //;s/ .*//p'`
 readonly KMODULEDIR=/lib/modules/$KERNELVERSION
 readonly STARTTIME=$SECONDS
 readonly UEFI_BOOTLOADER='/usr/lib/systemd/boot/efi/systemd-bootx64.efi'
@@ -189,7 +193,6 @@ readonly UEFI_PART_SIZE='200' # MiB; Value will be rounded down according to PAR
 # PARTITION_ALIGN_BLOCK_SIZE= For cheap flash drives "1" is not enough, use at least "4", safer is "8".
 # Optimizing Linux with cheap flash drives <https://lwn.net/Articles/428584/>
 readonly PARTITION_ALIGN_BLOCK_SIZE='8' # MiB; A too small value will result lower speed and less lifetime of your flash memory device.
-readonly KERNEL_FILE='/boot/vmlinuz-linux'
 readonly INITRAMFS_FILE='initramfs-linux-rescue.img'
 readonly SCRIPT_FILE="`$READLINK -f $( type -p "$0" || $ECHO "$0" )`"
 # required programs, if missing, abort.
