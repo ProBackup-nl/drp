@@ -842,7 +842,7 @@ function add_module() {
 
   if (( ${#firmware[*]} )); then
       add_firmware "${firmware[@]}" ||
-          warning 'Possibly missing firmware for module: %s' "$target"
+          echo "Possibly missing firmware for module: $target"
   fi
 
   # handle module quirks
