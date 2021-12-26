@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#   Copyright © 2017-2019, Ceriel Jacobs <http://probackup.nl>
+#   Copyright © 2017-2021, Ceriel Jacobs <http://probackup.nl>
 
 # Licence: GPL v3
 # This program is free software: you can redistribute it and/or modify
@@ -3111,12 +3111,10 @@ EOF
   readonly HOST_SRC=$HOST_LOCAL
   readonly LATEST='Latest'
 
-  if [[ "$1" == '--prepare' ]]; then
-    if [[ "$REPLY" != "No" ]]; then
+  if [[ ( "$1" == '--prepare' && "$REPLY" != 'No' ) || ( "$1" == '--mkbackup' && ! -e $SNAPSHOT_DST ) ]]; then
       # once create /Backups.backupdb/host_name folder
       $MKDIR $SNAPSHOT_DST
       $MKDIR $SNAPSHOT_DST/$HOST_SRC
-    fi
   fi
 
   #     -L: True if FILE exists and is a symbolic link.
